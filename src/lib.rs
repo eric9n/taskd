@@ -10,7 +10,7 @@ pub mod scheduler;
 pub mod state;
 pub mod task_runner;
 
-use std::process;
+use std::process::{self, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -287,6 +287,22 @@ async fn try_run_taskctl() -> Result<i32> {
             }
             Ok(0)
         }
+        Command::Logs { lines, follow } => {
+            if cli.json && follow {
+                anyhow::bail!("taskctl logs --json does not support --follow");
+            }
+            if cli.json {
+                let output = run_journalctl_capture(lines)?;
+                emit_json(&LogsOutput {
+                    service: "taskd",
+                    lines,
+                    output: String::from_utf8_lossy(&output.stdout).into_owned(),
+                })?;
+                Ok(output.status.code().unwrap_or(1))
+            } else {
+                run_journalctl_stream(lines, follow)
+            }
+        }
         Command::RunNow { id } => {
             let app = AppConfig::load(&cli.config)?;
             app.validate()?;
@@ -531,6 +547,45 @@ fn emit_json<T: Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+fn run_journalctl_capture(lines: usize) -> Result<std::process::Output> {
+    let output = ProcessCommand::new("journalctl")
+        .args(journalctl_args(lines, false))
+        .output()
+        .context("failed to execute journalctl for taskd logs")?;
+    if !output.status.success() && !output.stderr.is_empty() {
+        anyhow::bail!(
+            "journalctl returned non-zero status: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output)
+}
+
+fn run_journalctl_stream(lines: usize, follow: bool) -> Result<i32> {
+    let status = ProcessCommand::new("journalctl")
+        .args(journalctl_args(lines, follow))
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .context("failed to execute journalctl for taskd logs")?;
+    Ok(status.code().unwrap_or(1))
+}
+
+fn journalctl_args(lines: usize, follow: bool) -> Vec<String> {
+    let mut args = vec![
+        "-u".to_string(),
+        "taskd".to_string(),
+        "--no-pager".to_string(),
+        "-n".to_string(),
+        lines.to_string(),
+    ];
+    if follow {
+        args.push("-f".to_string());
+    }
+    args
+}
+
 #[derive(Serialize)]
 struct ValidateOutput {
     ok: bool,
@@ -594,6 +649,13 @@ struct HistoryOutput {
 }
 
 #[derive(Serialize)]
+struct LogsOutput {
+    service: &'static str,
+    lines: usize,
+    output: String,
+}
+
+#[derive(Serialize)]
 struct RunNowOutput {
     task_id: String,
     outcome: TaskOutcomeOutput,
@@ -633,5 +695,39 @@ impl From<ConcurrencyPolicyArg> for ConcurrencyPolicy {
             ConcurrencyPolicyArg::Forbid => ConcurrencyPolicy::Forbid,
             ConcurrencyPolicyArg::Replace => ConcurrencyPolicy::Replace,
         }
+    }
+}
+
+#[cfg(test)]
+mod logs_tests {
+    use super::journalctl_args;
+
+    #[test]
+    fn builds_journalctl_args_without_follow() {
+        assert_eq!(
+            journalctl_args(50, false),
+            vec![
+                "-u".to_string(),
+                "taskd".to_string(),
+                "--no-pager".to_string(),
+                "-n".to_string(),
+                "50".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_journalctl_args_with_follow() {
+        assert_eq!(
+            journalctl_args(20, true),
+            vec![
+                "-u".to_string(),
+                "taskd".to_string(),
+                "--no-pager".to_string(),
+                "-n".to_string(),
+                "20".to_string(),
+                "-f".to_string()
+            ]
+        );
     }
 }

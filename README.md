@@ -341,6 +341,16 @@ taskctl history backup-db --config /etc/taskd/tasks.yaml --limit 20
 taskctl recent-failures --config /etc/taskd/tasks.yaml --limit 20
 ```
 
+### Show service logs
+
+```bash
+taskctl logs
+taskctl logs --lines 200
+taskctl logs --follow
+```
+
+`taskctl logs` 是对 `journalctl -u taskd` 的便捷封装，适合直接在 systemd 主机上排障。
+
 ## Recommended Workflow
 
 第一版推荐工作流：

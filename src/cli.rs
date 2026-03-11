@@ -12,6 +12,7 @@ Examples:
   taskctl list
   taskctl show backup-db
   taskctl validate
+  taskctl logs --lines 200
   taskctl run-now backup-db
   taskctl add-cron backup-db \"backup database\" \"0 0 2 * * *\" /usr/local/bin/backup.sh -- --full
 
@@ -204,6 +205,17 @@ pub enum Command {
         )]
         limit: usize,
     },
+    #[command(about = "Show logs for the taskd systemd service via journalctl")]
+    Logs {
+        #[arg(
+            long,
+            default_value_t = 100,
+            help = "Maximum number of journal lines to show"
+        )]
+        lines: usize,
+        #[arg(long, help = "Follow the journal output continuously")]
+        follow: bool,
+    },
     #[command(about = "Run one task immediately outside its normal schedule")]
     RunNow {
         #[arg(help = "Task ID to execute now")]
@@ -328,6 +340,19 @@ mod tests {
             Command::History { id, limit } => {
                 assert_eq!(id, "job-1");
                 assert_eq!(limit, 5);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_logs() {
+        let cli = Cli::parse_from(["taskctl", "logs", "--lines", "50", "--follow"]);
+
+        match cli.command {
+            Command::Logs { lines, follow } => {
+                assert_eq!(lines, 50);
+                assert!(follow);
             }
             other => panic!("unexpected command: {other:?}"),
         }

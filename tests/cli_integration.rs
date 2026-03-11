@@ -67,6 +67,16 @@ tasks:
 }
 
 #[test]
+fn logs_rejects_json_follow_mode() {
+    let mut cmd = Command::cargo_bin("taskctl").expect("binary");
+    cmd.arg("--json").arg("logs").arg("--follow");
+
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "taskctl logs --json does not support --follow",
+    ));
+}
+
+#[test]
 fn add_interval_writes_task_to_yaml() {
     let dir = tempdir().expect("tempdir");
     let config = dir.path().join("tasks.yaml");
