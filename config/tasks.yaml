@@ -1,0 +1,12 @@
+version: 1
+tasks:
+  - id: health-check
+    name: health check
+    enabled: true
+    schedule:
+      kind: interval
+      seconds: 300
+    command:
+      program: /bin/echo
+      args:
+        - ok
