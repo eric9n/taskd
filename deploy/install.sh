@@ -62,6 +62,7 @@ build_binary() {
 install_files() {
   install -d "${INSTALL_DIR}" "${CONFIG_DIR}"
   install -m 0755 "${BUILD_ROOT}/target/release/taskd" "${INSTALL_DIR}/taskd"
+  install -m 0755 "${BUILD_ROOT}/target/release/taskctl" "${INSTALL_DIR}/taskctl"
 
   if [[ ! -f "${CONFIG_DIR}/tasks.yaml" ]]; then
     install -m 0644 "${BUILD_ROOT}/config/tasks.yaml" "${CONFIG_DIR}/tasks.yaml"
@@ -91,7 +92,7 @@ main() {
   checkout_source
   log "building release binary"
   build_binary
-  log "installing taskd files"
+  log "installing taskd binaries and config"
   install_files
   log "starting systemd service"
   start_service

@@ -3,6 +3,12 @@ tasks:
   - id: health-check
     name: health check
     enabled: true
+    concurrency:
+      policy: forbid
+      max_running: 1
+    retry:
+      max_attempts: 2
+      delay_seconds: 5
     schedule:
       kind: interval
       seconds: 300
@@ -10,3 +16,34 @@ tasks:
       program: /bin/echo
       args:
         - ok
+      timeout_seconds: 5
+
+  - id: daily-pipeline
+    name: daily pipeline
+    enabled: false
+    concurrency:
+      policy: forbid
+      max_running: 1
+    schedule:
+      kind: cron
+      expr: "0 0 3 * * *"
+    pipeline:
+      steps:
+        - id: extract
+          command:
+            program: /bin/sh
+            args:
+              - -c
+              - echo extract
+        - id: transform
+          command:
+            program: /bin/sh
+            args:
+              - -c
+              - echo transform
+        - id: publish
+          command:
+            program: /bin/sh
+            args:
+              - -c
+              - echo publish
