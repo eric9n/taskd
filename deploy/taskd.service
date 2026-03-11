@@ -1,0 +1,18 @@
+[Unit]
+Description=taskd scheduler daemon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=__TASKD_INSTALL_DIR__
+ExecStart=__TASKD_INSTALL_DIR__/taskd daemon --config __TASKD_CONFIG_DIR__/tasks.yaml
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=__TASKD_RUST_LOG__
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
