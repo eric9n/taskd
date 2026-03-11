@@ -422,9 +422,7 @@ curl -fsSL https://raw.githubusercontent.com/eric9n/taskd/main/deploy/install.sh
 脚本会完成：
 
 - 安装系统依赖
-- 安装 Rust toolchain（如果不存在）
-- 拉取 `eric9n/taskd` 仓库
-- 编译 release 二进制
+- 从 GitHub Release 下载预编译二进制包
 - 安装到 `/opt/taskd/taskd` 和 `/opt/taskd/taskctl`
 - 安装配置到 `/etc/taskd/tasks.yaml`
 - 安装并启动 `systemd` 服务
@@ -432,17 +430,43 @@ curl -fsSL https://raw.githubusercontent.com/eric9n/taskd/main/deploy/install.sh
 可选环境变量：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eric9n/taskd/main/deploy/install.sh | sudo TASKD_REPO_REF=main TASKD_INSTALL_DIR=/opt/taskd bash
+curl -fsSL https://raw.githubusercontent.com/eric9n/taskd/main/deploy/install.sh | sudo TASKD_RELEASE=v0.1.0 TASKD_INSTALL_DIR=/opt/taskd bash
 ```
 
-- `TASKD_REPO_URL`
-- `TASKD_REPO_REF`
+- `TASKD_GITHUB_REPOSITORY`
+- `TASKD_RELEASE`
+- `TASKD_ASSET_NAME`
 - `TASKD_INSTALL_DIR`
 - `TASKD_CONFIG_DIR`
 - `TASKD_SYSTEMD_UNIT_PATH`
-- `TASKD_BUILD_ROOT`
-- `TASKD_RUST_TOOLCHAIN`
+- `TASKD_DOWNLOAD_ROOT`
 - `TASKD_RUST_LOG`
+
+默认会下载 `latest` release，对应资产名是 `taskd-x86_64-unknown-linux-gnu.tar.gz`。
+
+## Release
+
+仓库已配置 tag 驱动的 GitHub Actions release workflow：
+
+- workflow 文件：`.github/workflows/release.yml`
+- 触发条件：push `v*` tag
+- 产物：
+  - `taskd-x86_64-unknown-linux-gnu.tar.gz`
+  - `taskd-x86_64-unknown-linux-gnu.tar.gz.sha256`
+
+发布方式：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+workflow 会自动：
+
+- 执行 `cargo test --locked`
+- 构建 release 二进制
+- 打包 `taskd`、`taskctl`、示例配置和 systemd service
+- 创建或更新对应 GitHub Release，并上传资产
 
 ## Logging
 

@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${TASKD_REPO_URL:-https://github.com/eric9n/taskd.git}"
-REPO_REF="${TASKD_REPO_REF:-main}"
+GITHUB_REPOSITORY="${TASKD_GITHUB_REPOSITORY:-eric9n/taskd}"
+TASKD_RELEASE="${TASKD_RELEASE:-latest}"
+TASKD_ASSET_NAME="${TASKD_ASSET_NAME:-taskd-x86_64-unknown-linux-gnu.tar.gz}"
 INSTALL_DIR="${TASKD_INSTALL_DIR:-/opt/taskd}"
 CONFIG_DIR="${TASKD_CONFIG_DIR:-/etc/taskd}"
 SYSTEMD_UNIT_PATH="${TASKD_SYSTEMD_UNIT_PATH:-/etc/systemd/system/taskd.service}"
-BUILD_ROOT="${TASKD_BUILD_ROOT:-/tmp/taskd-build}"
-RUST_TOOLCHAIN="${TASKD_RUST_TOOLCHAIN:-stable}"
+DOWNLOAD_ROOT="${TASKD_DOWNLOAD_ROOT:-/tmp/taskd-release}"
 RUST_LOG_VALUE="${TASKD_RUST_LOG:-info}"
+
+ARCHIVE_PATH="${DOWNLOAD_ROOT}/${TASKD_ASSET_NAME}"
+ARCHIVE_ROOT="${TASKD_ASSET_NAME%.tar.gz}"
+EXTRACT_ROOT="${DOWNLOAD_ROOT}/extract"
 
 log() {
   printf '[taskd-deploy] %s\n' "$*"
@@ -25,54 +29,69 @@ ensure_apt_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y --no-install-recommends \
-    build-essential \
     ca-certificates \
     curl \
-    git \
-    pkg-config
+    tar
 }
 
-ensure_rust() {
-  if command -v cargo >/dev/null 2>&1; then
-    return
-  fi
-
-  log "installing rust toolchain"
-  curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs \
-    | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"
-}
-
-load_rust_env() {
-  if [[ -f "${HOME}/.cargo/env" ]]; then
-    # shellcheck disable=SC1090
-    source "${HOME}/.cargo/env"
+release_base_url() {
+  if [[ "${TASKD_RELEASE}" == "latest" ]]; then
+    printf 'https://github.com/%s/releases/latest/download' "${GITHUB_REPOSITORY}"
+  else
+    printf 'https://github.com/%s/releases/download/%s' "${GITHUB_REPOSITORY}" "${TASKD_RELEASE}"
   fi
 }
 
-checkout_source() {
-  rm -rf "${BUILD_ROOT}"
-  git clone --depth 1 --branch "${REPO_REF}" "${REPO_URL}" "${BUILD_ROOT}"
+download_release() {
+  local base_url checksum_path checksum_url
+
+  rm -rf "${DOWNLOAD_ROOT}"
+  install -d "${EXTRACT_ROOT}"
+
+  base_url="$(release_base_url)"
+  log "downloading ${TASKD_ASSET_NAME} from ${base_url}"
+  curl -fL "${base_url}/${TASKD_ASSET_NAME}" -o "${ARCHIVE_PATH}"
+
+  checksum_url="${base_url}/${TASKD_ASSET_NAME}.sha256"
+  checksum_path="${ARCHIVE_PATH}.sha256"
+  if curl -fsSL "${checksum_url}" -o "${checksum_path}"; then
+    (
+      cd "${DOWNLOAD_ROOT}"
+      sha256sum -c "$(basename "${checksum_path}")"
+    )
+  else
+    log "checksum file not found, skipping verification"
+  fi
+
+  tar -xzf "${ARCHIVE_PATH}" -C "${EXTRACT_ROOT}"
 }
 
-build_binary() {
-  load_rust_env
-  cargo build --release --manifest-path "${BUILD_ROOT}/Cargo.toml"
+release_root() {
+  printf '%s/%s' "${EXTRACT_ROOT}" "${ARCHIVE_ROOT}"
 }
 
 install_files() {
+  local root
+  root="$(release_root)"
+
+  if [[ ! -x "${root}/bin/taskd" || ! -x "${root}/bin/taskctl" ]]; then
+    echo "release archive is missing taskd binaries" >&2
+    exit 1
+  fi
+
   install -d "${INSTALL_DIR}" "${CONFIG_DIR}"
-  install -m 0755 "${BUILD_ROOT}/target/release/taskd" "${INSTALL_DIR}/taskd"
-  install -m 0755 "${BUILD_ROOT}/target/release/taskctl" "${INSTALL_DIR}/taskctl"
+  install -m 0755 "${root}/bin/taskd" "${INSTALL_DIR}/taskd"
+  install -m 0755 "${root}/bin/taskctl" "${INSTALL_DIR}/taskctl"
 
   if [[ ! -f "${CONFIG_DIR}/tasks.yaml" ]]; then
-    install -m 0644 "${BUILD_ROOT}/config/tasks.yaml" "${CONFIG_DIR}/tasks.yaml"
+    install -m 0644 "${root}/config/tasks.yaml" "${CONFIG_DIR}/tasks.yaml"
   fi
 
   sed \
     -e "s|__TASKD_INSTALL_DIR__|${INSTALL_DIR}|g" \
     -e "s|__TASKD_CONFIG_DIR__|${CONFIG_DIR}|g" \
     -e "s|__TASKD_RUST_LOG__|${RUST_LOG_VALUE}|g" \
-    "${BUILD_ROOT}/deploy/taskd.service" > "${SYSTEMD_UNIT_PATH}"
+    "${root}/deploy/taskd.service" > "${SYSTEMD_UNIT_PATH}"
 }
 
 start_service() {
@@ -86,12 +105,7 @@ main() {
   require_root
   log "installing system packages"
   ensure_apt_packages
-  ensure_rust
-  load_rust_env
-  log "cloning ${REPO_URL}#${REPO_REF}"
-  checkout_source
-  log "building release binary"
-  build_binary
+  download_release
   log "installing taskd binaries and config"
   install_files
   log "starting systemd service"
