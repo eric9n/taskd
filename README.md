@@ -247,16 +247,22 @@ command:
 
 ## CLI Usage
 
+默认配置路径规则：
+
+- 如果 `/etc/taskd/tasks.yaml` 存在，`taskd` 和 `taskctl` 默认读取它
+- 否则回退到仓库内的 `config/tasks.yaml`
+- 你仍然可以用 `--config` 显式指定别的配置文件
+
 ### Run daemon
 
 ```bash
-taskd daemon --config /etc/taskd/tasks.yaml
+taskd daemon
 ```
 
 ### List tasks
 
 ```bash
-taskctl list --config /etc/taskd/tasks.yaml
+taskctl list
 ```
 
 `list` 会同时展示最近一次运行状态和时间。如果状态文件不存在，会显示 `-`。
@@ -379,10 +385,10 @@ journalctl -u taskd -f
 
 ## Runtime State
 
-`taskd` 会在配置文件旁边维护一个轻量状态快照文件：
+`taskd` 会维护一个轻量状态快照文件：
 
 - `config/tasks.yaml` -> `config/tasks.state.yaml`
-- `/etc/taskd/tasks.yaml` -> `/etc/taskd/tasks.state.yaml`
+- `/etc/taskd/tasks.yaml` -> `/var/lib/taskd/tasks.state.yaml`
 
 这份文件会记录每个任务最近一次运行的：
 
@@ -395,10 +401,10 @@ daemon 调度执行和 `taskctl run-now` 都会更新这份状态文件，`taskc
 
 ## History Persistence
 
-`taskd` 还会在配置文件旁边维护 SQLite 历史库：
+`taskd` 还会维护 SQLite 历史库：
 
 - `config/tasks.yaml` -> `config/tasks.history.db`
-- `/etc/taskd/tasks.yaml` -> `/etc/taskd/tasks.history.db`
+- `/etc/taskd/tasks.yaml` -> `/var/lib/taskd/tasks.history.db`
 
 这份数据库会记录每次执行的：
 
@@ -425,6 +431,7 @@ curl -fsSL https://raw.githubusercontent.com/eric9n/taskd/main/deploy/install.sh
 - 从 GitHub Release 下载预编译二进制包
 - 安装到 `/opt/taskd/taskd` 和 `/opt/taskd/taskctl`
 - 安装配置到 `/etc/taskd/tasks.yaml`
+- 安装运行时数据目录到 `/var/lib/taskd`
 - 安装并启动 `systemd` 服务
 
 可选环境变量：
@@ -438,6 +445,7 @@ curl -fsSL https://raw.githubusercontent.com/eric9n/taskd/main/deploy/install.sh
 - `TASKD_ASSET_NAME`
 - `TASKD_INSTALL_DIR`
 - `TASKD_CONFIG_DIR`
+- `TASKD_DATA_DIR`
 - `TASKD_SYSTEMD_UNIT_PATH`
 - `TASKD_DOWNLOAD_ROOT`
 - `TASKD_RUST_LOG`

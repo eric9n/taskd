@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 
+use crate::runtime_paths::runtime_data_path_for_config;
 use crate::task_runner::{TaskOutcome, TaskStepResult};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -159,12 +160,7 @@ impl HistoryStore {
 }
 
 pub fn history_path_for_config(config_path: &Path) -> PathBuf {
-    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let stem = config_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("tasks");
-    parent.join(format!("{stem}.history.db"))
+    runtime_data_path_for_config(config_path, "history.db")
 }
 
 fn map_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRecord> {
@@ -256,6 +252,12 @@ mod tests {
     fn derives_history_path_from_config_path() {
         let path = history_path_for_config(std::path::Path::new("/tmp/taskd/tasks.yaml"));
         assert_eq!(path, PathBuf::from("/tmp/taskd/tasks.history.db"));
+    }
+
+    #[test]
+    fn derives_history_path_from_system_config_path() {
+        let path = history_path_for_config(std::path::Path::new("/etc/taskd/tasks.yaml"));
+        assert_eq!(path, PathBuf::from("/var/lib/taskd/tasks.history.db"));
     }
 
     #[test]

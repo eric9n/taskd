@@ -6,6 +6,7 @@ TASKD_RELEASE="${TASKD_RELEASE:-latest}"
 TASKD_ASSET_NAME="${TASKD_ASSET_NAME:-taskd-x86_64-unknown-linux-gnu.tar.gz}"
 INSTALL_DIR="${TASKD_INSTALL_DIR:-/opt/taskd}"
 CONFIG_DIR="${TASKD_CONFIG_DIR:-/etc/taskd}"
+DATA_DIR="${TASKD_DATA_DIR:-/var/lib/taskd}"
 SYSTEMD_UNIT_PATH="${TASKD_SYSTEMD_UNIT_PATH:-/etc/systemd/system/taskd.service}"
 DOWNLOAD_ROOT="${TASKD_DOWNLOAD_ROOT:-/tmp/taskd-release}"
 RUST_LOG_VALUE="${TASKD_RUST_LOG:-info}"
@@ -79,7 +80,7 @@ install_files() {
     exit 1
   fi
 
-  install -d "${INSTALL_DIR}" "${CONFIG_DIR}"
+  install -d "${INSTALL_DIR}" "${CONFIG_DIR}" "${DATA_DIR}"
   install -m 0755 "${root}/bin/taskd" "${INSTALL_DIR}/taskd"
   install -m 0755 "${root}/bin/taskctl" "${INSTALL_DIR}/taskctl"
 
@@ -87,11 +88,25 @@ install_files() {
     install -m 0644 "${root}/config/tasks.yaml" "${CONFIG_DIR}/tasks.yaml"
   fi
 
+  if [[ "${CONFIG_DIR}" == "/etc/taskd" ]]; then
+    migrate_runtime_data
+  fi
+
   sed \
     -e "s|__TASKD_INSTALL_DIR__|${INSTALL_DIR}|g" \
     -e "s|__TASKD_CONFIG_DIR__|${CONFIG_DIR}|g" \
     -e "s|__TASKD_RUST_LOG__|${RUST_LOG_VALUE}|g" \
     "${root}/deploy/taskd.service" > "${SYSTEMD_UNIT_PATH}"
+}
+
+migrate_runtime_data() {
+  if [[ -f "${CONFIG_DIR}/tasks.state.yaml" && ! -f "${DATA_DIR}/tasks.state.yaml" ]]; then
+    mv "${CONFIG_DIR}/tasks.state.yaml" "${DATA_DIR}/tasks.state.yaml"
+  fi
+
+  if [[ -f "${CONFIG_DIR}/tasks.history.db" && ! -f "${DATA_DIR}/tasks.history.db" ]]; then
+    mv "${CONFIG_DIR}/tasks.history.db" "${DATA_DIR}/tasks.history.db"
+  fi
 }
 
 start_service() {

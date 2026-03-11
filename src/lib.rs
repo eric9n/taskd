@@ -2,8 +2,10 @@
 
 pub mod cli;
 pub mod config;
+pub mod config_path;
 pub mod daemon_cli;
 pub mod history;
+pub mod runtime_paths;
 pub mod scheduler;
 pub mod state;
 pub mod task_runner;
