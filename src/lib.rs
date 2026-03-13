@@ -38,7 +38,7 @@ use crate::state::{
 use crate::task_runner::{TaskOutcome, TaskRunStatus, TaskStepResult};
 
 pub async fn run_taskd() -> i32 {
-    if let Err(error) = init_tracing() {
+    if let Err(error) = init_tracing("info") {
         eprintln!("failed to initialize logging: {error:#}");
         return 1;
     }
@@ -53,7 +53,7 @@ pub async fn run_taskd() -> i32 {
 }
 
 pub async fn run_taskctl() -> i32 {
-    if let Err(error) = init_tracing() {
+    if let Err(error) = init_tracing("warn") {
         eprintln!("failed to initialize logging: {error:#}");
         return 1;
     }
@@ -405,8 +405,9 @@ async fn try_run_taskctl() -> Result<i32> {
     }
 }
 
-fn init_tracing() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+fn init_tracing(default_filter: &str) -> Result<()> {
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

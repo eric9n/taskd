@@ -203,8 +203,7 @@ tasks:
         .stdout(predicate::str::contains("\"task_id\": \"json-job\""))
         .stdout(predicate::str::contains("\"status\": \"success\""))
         .stdout(predicate::str::contains("INFO").not())
-        .stderr(predicate::str::contains("starting task"))
-        .stderr(predicate::str::contains("task completed"));
+        .stderr(predicate::str::is_empty());
 }
 
 #[test]
