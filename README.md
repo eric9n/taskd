@@ -6,6 +6,7 @@
 
 - 用 YAML 配置文件定义任务
 - 用 `taskctl` 增删改查任务、手动执行任务、查询历史
+- 用 `artifactctl` 运行通用的 collect / render / sink artifact 流程
 - 用 `taskd daemon` 加载并调度任务
 - 用 `systemd` 托管进程、查看日志、开机自启
 
@@ -20,6 +21,7 @@
 - 支持手动立即执行任务
 - 支持配置校验
 - 支持通过 `systemd` 进行守护和日志管理
+- 支持独立的 artifact workflow 配置
 
 ## Project Layout
 
@@ -27,14 +29,18 @@
 taskd/
 ├─ Cargo.toml
 ├─ config/
+│  ├─ artifacts.yaml
 │  └─ tasks.yaml
 ├─ deploy/
 │  ├─ install.sh
 │  └─ taskd.service
 ├─ src/
 │  ├─ bin/
+│  │  ├─ artifactctl.rs
 │  │  └─ taskctl.rs
 │  ├─ main.rs
+│  ├─ artifact_cli.rs
+│  ├─ artifacts.rs
 │  ├─ daemon_cli.rs
 │  ├─ cli.rs
 │  ├─ config.rs
@@ -43,6 +49,7 @@ taskd/
 │  ├─ state.rs
 │  └─ task_runner.rs
 └─ tests/
+   ├─ artifact_cli_integration.rs
    └─ cli_integration.rs
 ```
 
@@ -70,6 +77,12 @@ cargo build --release
 
 ```bash
 ./target/release/taskctl list --config ./config/tasks.yaml
+```
+
+5. Validate artifact config
+
+```bash
+./target/release/artifactctl validate --config ./config/artifacts.yaml
 ```
 
 ## Configuration
@@ -131,6 +144,52 @@ tasks:
             program: "/bin/sh"
             args: ["-c", "echo publish"]
 ```
+
+artifact workflow 配置单独放在 `artifacts.yaml`，例如：
+
+```yaml
+version: 1
+
+artifacts:
+  - id: daily_ops
+    timezone: Asia/Shanghai
+    workdir: /var/lib/taskd/artifacts/daily_ops
+    collectors:
+      - id: taskd
+        command:
+          program: /opt/taskd/taskctl
+          args:
+            - --json
+            - report
+            - daily
+            - --date
+            - "{{artifact_date}}"
+            - --timezone
+            - Asia/Shanghai
+            - --output
+            - "{{collector_output}}"
+    renderer:
+      program: /usr/local/bin/render-artifact-agent
+      args:
+        - --input
+        - "{{render_input_file}}"
+        - --output
+        - "{{render_file}}"
+    sinks:
+      - id: discord
+        command:
+          program: /usr/local/bin/post-discord-webhook
+          args:
+            - --input
+            - "{{render_file}}"
+```
+
+`artifactctl` 会在每个 artifact 的工作目录下按日期生成：
+
+- `records.jsonl`
+- `render-input.json`
+- `rendered.json`
+- `run.json`
 
 ## Configuration Fields
 

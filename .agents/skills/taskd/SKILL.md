@@ -10,8 +10,8 @@ description: taskd is a single-host scheduler daemon for managing cron and inter
 ## Remote host
 
 - For this project, when operating the installed scheduler, run commands on `vps(host:srv1313960)`, not on the local machine
-- Prefer `ssh srv1313960 'taskctl ...'`
-- If `taskctl` is not in `PATH` on the VPS, use `ssh srv1313960 '/opt/taskd/taskctl ...'`
+- On the VPS, prefer the absolute CLI path to avoid `PATH` drift: `ssh srv1313960 '/opt/taskd/taskctl ...'`
+- Use `ssh srv1313960 'taskctl ...'` only if you have already confirmed `taskctl` is in `PATH`
 - Use local `taskctl` only when you are explicitly working with this repository's local `config/tasks.yaml`
 
 ## Command paths
@@ -158,22 +158,22 @@ On an installed host, verify:
 
 ```bash
 systemctl status taskd --no-pager
-taskctl list
+ssh srv1313960 '/opt/taskd/taskctl list'
 journalctl -u taskd -n 100 --no-pager
 ```
 
 Expect:
 
 - `taskd.service` is active
-- `taskctl list` can read `/etc/taskd/tasks.yaml` without `--config`
+- `/opt/taskd/taskctl list` can read `/etc/taskd/tasks.yaml` without `--config`
 - logs show scheduler startup without config validation failures
 
 Quick debugging commands:
 
 ```bash
-taskctl validate
-taskctl show <id>
-taskctl history <id> --limit 20
-taskctl recent-failures --limit 20
-taskctl logs --lines 100
+ssh srv1313960 '/opt/taskd/taskctl validate'
+ssh srv1313960 '/opt/taskd/taskctl show <id>'
+ssh srv1313960 '/opt/taskd/taskctl history <id> --limit 20'
+ssh srv1313960 '/opt/taskd/taskctl recent-failures --limit 20'
+ssh srv1313960 '/opt/taskd/taskctl logs --lines 100'
 ```

@@ -78,11 +78,10 @@
 
 ### 部署
 - [x] 编写 `taskd.service`
-- [ ] 本地测试 `systemctl start`
-- [ ] 本地测试 `systemctl restart`
-- [ ] 本地测试 `systemctl status`
-- [ ] 本地测试 `journalctl -u taskd -f`
-- [ ] 测试开机自启
+- [x] 在 Ubuntu VPS 测试 `systemctl start`
+- [x] 在 Ubuntu VPS 测试 `systemctl restart`
+- [x] 在 Ubuntu VPS 测试 `systemctl status`
+- [x] 在 Ubuntu VPS 测试 `journalctl -u taskd -f`
 
 ---
 
@@ -180,9 +179,9 @@
 - [x] 能启动 daemon
 - [x] 能按 cron 执行任务
 - [x] 能按 interval 执行任务
-- [ ] 能通过 systemd 管理
-- [ ] 能通过 journald 查看日志
-- [ ] 修改配置后重启服务能生效
+- [x] 能通过 systemd 管理
+- [x] 能通过 journald 查看日志
+- [x] 修改配置后重启服务能生效
 
 ---
 

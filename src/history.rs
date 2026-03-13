@@ -141,6 +141,29 @@ impl HistoryStore {
         collect_rows(rows)
     }
 
+    pub fn list_history_between(
+        &self,
+        started_at: DateTime<Utc>,
+        finished_before: DateTime<Utc>,
+    ) -> Result<Vec<HistoryRecord>> {
+        let Some(conn) = self.open_ro_connection_if_present()? else {
+            return Ok(Vec::new());
+        };
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, task_id, status, summary, exit_code, started_at, finished_at, step_details
+            FROM task_history
+            WHERE finished_at >= ?1 AND finished_at < ?2
+            ORDER BY finished_at DESC, id DESC
+            "#,
+        )?;
+        let rows = stmt.query_map(
+            params![started_at.to_rfc3339(), finished_before.to_rfc3339()],
+            map_history_row,
+        )?;
+        collect_rows(rows)
+    }
+
     fn open_rw_connection(&self) -> Result<Connection> {
         open_connection(
             &self.path,

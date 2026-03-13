@@ -12,6 +12,7 @@ Examples:
   taskctl list
   taskctl show backup-db
   taskctl validate
+  taskctl --json report daily --date 2026-03-12 --timezone Asia/Shanghai
   taskctl logs --lines 200
   taskctl run-now backup-db
   taskctl add-cron backup-db \"backup database\" \"0 0 2 * * *\" /usr/local/bin/backup.sh -- --full
@@ -221,6 +222,27 @@ pub enum Command {
         #[arg(help = "Task ID to execute now")]
         id: String,
     },
+    #[command(about = "Generate structured taskd reports")]
+    Report {
+        #[command(subcommand)]
+        command: ReportCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ReportCommand {
+    #[command(about = "Generate a daily summary from task execution history")]
+    Daily {
+        #[arg(long, help = "Business date in YYYY-MM-DD format")]
+        date: String,
+        #[arg(
+            long,
+            help = "IANA timezone name used to define the day window, for example Asia/Shanghai"
+        )]
+        timezone: String,
+        #[arg(long, help = "Optional file path to write the JSON report to")]
+        output: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -249,7 +271,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Cli, Command, ConcurrencyPolicyArg};
+    use super::{Cli, Command, ConcurrencyPolicyArg, ReportCommand};
 
     #[test]
     fn parses_add_cron_with_trailing_args() {
@@ -354,6 +376,38 @@ mod tests {
                 assert_eq!(lines, 50);
                 assert!(follow);
             }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_daily_report() {
+        let cli = Cli::parse_from([
+            "taskctl",
+            "--json",
+            "report",
+            "daily",
+            "--date",
+            "2026-03-12",
+            "--timezone",
+            "Asia/Shanghai",
+            "--output",
+            "/tmp/report.json",
+        ]);
+
+        assert!(cli.json);
+        match cli.command {
+            Command::Report { command } => match command {
+                ReportCommand::Daily {
+                    date,
+                    timezone,
+                    output,
+                } => {
+                    assert_eq!(date, "2026-03-12");
+                    assert_eq!(timezone, "Asia/Shanghai");
+                    assert_eq!(output, Some(PathBuf::from("/tmp/report.json")));
+                }
+            },
             other => panic!("unexpected command: {other:?}"),
         }
     }

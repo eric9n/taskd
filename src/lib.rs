@@ -1,5 +1,7 @@
 //! Shared library entrypoints for the `taskd` daemon and `taskctl` control plane.
 
+pub mod artifact_cli;
+pub mod artifacts;
 pub mod cli;
 pub mod config;
 pub mod config_path;
@@ -13,15 +15,17 @@ pub mod task_runner;
 use std::path::Path;
 use std::process::{self, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
+use std::{collections::BTreeMap, fs::File};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use clap::Parser;
 use serde::Serialize;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Command, ConcurrencyPolicyArg};
+use crate::artifact_cli::ArtifactCli;
+use crate::cli::{Cli, Command, ConcurrencyPolicyArg, ReportCommand};
 use crate::config::{
     AppConfig, CommandConfig, ConcurrencyConfig, ConcurrencyPolicy, PipelineConfig, RetryConfig,
     ScheduleConfig, TaskConfig,
@@ -64,6 +68,21 @@ pub async fn run_taskctl() -> i32 {
     }
 }
 
+pub async fn run_artifactctl() -> i32 {
+    if let Err(error) = init_tracing() {
+        eprintln!("failed to initialize logging: {error:#}");
+        return 1;
+    }
+
+    match try_run_artifactctl().await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            1
+        }
+    }
+}
+
 async fn try_run_taskd() -> Result<i32> {
     let cli = TaskdCli::parse();
 
@@ -77,6 +96,11 @@ async fn try_run_taskd() -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+async fn try_run_artifactctl() -> Result<i32> {
+    let cli = ArtifactCli::parse();
+    artifacts::run(cli).await
 }
 
 fn load_valid_daemon_config(config_path: &Path) -> Result<AppConfig> {
@@ -368,6 +392,28 @@ async fn try_run_taskctl() -> Result<i32> {
             }
             Ok(outcome.exit_code())
         }
+        Command::Report { command } => match command {
+            ReportCommand::Daily {
+                date,
+                timezone,
+                output,
+            } => {
+                let report = build_daily_report_output(&cli.config, &date, &timezone)?;
+                if let Some(output) = output {
+                    let file = File::create(&output).with_context(|| {
+                        format!("failed to create report output '{}'", output.display())
+                    })?;
+                    serde_json::to_writer_pretty(file, &report).with_context(|| {
+                        format!("failed to write report output '{}'", output.display())
+                    })?;
+                } else if cli.json {
+                    emit_json(&report)?;
+                } else {
+                    print_daily_report(&report);
+                }
+                Ok(0)
+            }
+        },
     }
 }
 
@@ -630,6 +676,119 @@ fn journalctl_args(lines: usize, follow: bool) -> Vec<String> {
     args
 }
 
+fn build_daily_report_output(
+    config_path: &Path,
+    date: &str,
+    timezone: &str,
+) -> Result<DailyReportRecordOutput> {
+    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .with_context(|| format!("invalid report date '{date}', expected YYYY-MM-DD"))?;
+    let timezone = timezone
+        .parse::<chrono_tz::Tz>()
+        .with_context(|| format!("invalid timezone '{timezone}'"))?;
+    let start_local = timezone
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single()
+        .ok_or_else(|| {
+            anyhow::anyhow!("failed to resolve start of day for {date} in {timezone}")
+        })?;
+    let end_local = start_local + chrono::Duration::days(1);
+    let start_utc = start_local.with_timezone(&Utc);
+    let end_utc = end_local.with_timezone(&Utc);
+
+    let rows = HistoryStore::for_read_only(config_path).list_history_between(start_utc, end_utc)?;
+
+    let mut totals = BTreeMap::new();
+    let mut task_summaries = BTreeMap::<String, DailyTaskSummary>::new();
+    let mut failures = Vec::new();
+    for row in rows {
+        *totals.entry(row.status.clone()).or_insert(0) += 1;
+        let entry = task_summaries
+            .entry(row.task_id.clone())
+            .or_insert_with(|| DailyTaskSummary {
+                task_id: row.task_id.clone(),
+                run_count: 0,
+                failure_count: 0,
+                last_status: row.status.clone(),
+                last_summary: row.summary.clone(),
+                last_finished_at: row.finished_at,
+            });
+        entry.run_count += 1;
+        if row.status != "success" {
+            entry.failure_count += 1;
+            failures.push(DailyFailureSummary::from(&row));
+        }
+        if row.finished_at > entry.last_finished_at {
+            entry.last_status = row.status.clone();
+            entry.last_summary = row.summary.clone();
+            entry.last_finished_at = row.finished_at;
+        }
+    }
+
+    let total_runs = totals.values().sum();
+    let status = if totals.get("error").copied().unwrap_or(0) > 0 {
+        "error"
+    } else if total_runs == 0
+        || totals
+            .iter()
+            .any(|(status, count)| status != "success" && *count > 0)
+    {
+        "warn"
+    } else {
+        "ok"
+    };
+    let failure_count = failures.len();
+    let summary = if total_runs == 0 {
+        format!("no task runs recorded for {date}")
+    } else if failure_count == 0 {
+        format!("{total_runs} task runs recorded for {date}, all successful")
+    } else {
+        format!("{total_runs} task runs recorded for {date}, {failure_count} failures")
+    };
+
+    let tasks = task_summaries.into_values().collect::<Vec<_>>();
+    Ok(DailyReportRecordOutput {
+        schema_version: 1,
+        status: status.to_string(),
+        summary,
+        content_type: "application/json".to_string(),
+        payload: DailyReportPayload {
+            date: date.to_string(),
+            timezone: timezone.name().to_string(),
+            window_start: start_utc,
+            window_end: end_utc,
+            totals,
+            total_runs,
+            tasks,
+            failures,
+        },
+    })
+}
+
+fn print_daily_report(report: &DailyReportRecordOutput) {
+    println!("status: {}", report.status);
+    println!("summary: {}", report.summary);
+    println!("date: {}", report.payload.date);
+    println!("timezone: {}", report.payload.timezone);
+    println!("window_start: {}", report.payload.window_start.to_rfc3339());
+    println!("window_end: {}", report.payload.window_end.to_rfc3339());
+    println!("total_runs: {}", report.payload.total_runs);
+    if report.payload.totals.is_empty() {
+        println!("totals: -");
+    } else {
+        let totals = report
+            .payload
+            .totals
+            .iter()
+            .map(|(status, count)| format!("{status}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("totals: {totals}");
+    }
+    println!("tasks: {}", report.payload.tasks.len());
+    println!("failures: {}", report.payload.failures.len());
+}
+
 #[derive(Serialize)]
 struct ValidateOutput {
     ok: bool,
@@ -703,6 +862,60 @@ struct LogsOutput {
 struct RunNowOutput {
     task_id: String,
     outcome: TaskOutcomeOutput,
+}
+
+#[derive(Serialize)]
+struct DailyReportRecordOutput {
+    schema_version: u32,
+    status: String,
+    summary: String,
+    content_type: String,
+    payload: DailyReportPayload,
+}
+
+#[derive(Serialize)]
+struct DailyReportPayload {
+    date: String,
+    timezone: String,
+    window_start: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+    totals: BTreeMap<String, usize>,
+    total_runs: usize,
+    tasks: Vec<DailyTaskSummary>,
+    failures: Vec<DailyFailureSummary>,
+}
+
+#[derive(Serialize)]
+struct DailyTaskSummary {
+    task_id: String,
+    run_count: usize,
+    failure_count: usize,
+    last_status: String,
+    last_summary: String,
+    last_finished_at: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct DailyFailureSummary {
+    task_id: String,
+    status: String,
+    summary: String,
+    exit_code: i32,
+    finished_at: DateTime<Utc>,
+    step_details: Vec<TaskStepResult>,
+}
+
+impl From<&HistoryRecord> for DailyFailureSummary {
+    fn from(value: &HistoryRecord) -> Self {
+        Self {
+            task_id: value.task_id.clone(),
+            status: value.status.clone(),
+            summary: value.summary.clone(),
+            exit_code: value.exit_code,
+            finished_at: value.finished_at,
+            step_details: value.step_details.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
