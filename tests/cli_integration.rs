@@ -165,7 +165,46 @@ tasks:
     cmd.assert()
         .failure()
         .code(1)
-        .stdout(predicate::str::contains("failed to run task 'missing'"));
+        .stderr(predicate::str::contains("failed to run task 'missing'"));
+}
+
+#[test]
+fn run_now_json_keeps_stdout_machine_readable() {
+    let dir = tempdir().expect("tempdir");
+    let config = dir.path().join("tasks.yaml");
+    fs::write(
+        &config,
+        r#"
+version: 1
+tasks:
+  - id: json-job
+    name: json job
+    enabled: true
+    schedule:
+      kind: interval
+      seconds: 10
+    command:
+      program: /bin/echo
+      args:
+        - ok
+"#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::cargo_bin("taskctl").expect("binary");
+    cmd.arg("--config")
+        .arg(&config)
+        .arg("--json")
+        .arg("run-now")
+        .arg("json-job");
+
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("\"task_id\": \"json-job\""))
+        .stdout(predicate::str::contains("\"status\": \"success\""))
+        .stdout(predicate::str::contains("INFO").not())
+        .stderr(predicate::str::contains("starting task"))
+        .stderr(predicate::str::contains("task completed"));
 }
 
 #[test]
