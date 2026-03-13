@@ -53,7 +53,7 @@ pub async fn run_taskd() -> i32 {
 }
 
 pub async fn run_taskctl() -> i32 {
-    if let Err(error) = init_tracing("warn") {
+    if let Err(error) = init_tracing("error") {
         eprintln!("failed to initialize logging: {error:#}");
         return 1;
     }
