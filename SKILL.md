@@ -7,12 +7,12 @@ description: taskd is a single-host scheduler daemon for managing cron and inter
 
 `taskd` is a single-host scheduler daemon. `taskctl` is its control-plane CLI.
 
-## Remote host
+## Execution context
 
-- For this project, when operating the installed scheduler, run commands on `vps(host:srv1313960)`, not on the local machine
-- Prefer `ssh srv1313960 'taskctl ...'`
-- If `taskctl` is not in `PATH` on the VPS, use `ssh srv1313960 '/opt/taskd/taskctl ...'`
-- Use local `taskctl` only when you are explicitly working with this repository's local `config/tasks.yaml`
+- For this project, operate `taskd` and `taskctl` on the local machine by default
+- Prefer the installed scheduler config when it exists at `/etc/taskd/tasks.yaml`
+- Use a repo-local config such as `./config/tasks.yaml` only when the task is explicitly about a local checkout or test setup
+- Do not assume any remote VPS, SSH hop, or host alias unless the user explicitly asks for remote operations
 
 ## Command paths
 
@@ -37,8 +37,10 @@ description: taskd is a single-host scheduler daemon for managing cron and inter
 
 `taskctl`:
 
-- `--config <PATH>`: config file path; same lookup rule as `taskd`
-- `--json`: return machine-readable JSON instead of table/text output
+- `--config <PATH>`: global option for all subcommands; same lookup rule as `taskd`
+- `--json`: global option; meaningful for `list`, `show`, `validate`, `history`, `recent-failures`, `logs`, `run-now`, `report daily`, and also `remove` / `enable` / `disable`
+- `taskctl logs --json` cannot be combined with `--follow`
+- `add-cron` and `add-interval` currently accept `--json` because it is global, but they do not emit structured JSON output; do not rely on it
 
 ## Daemon commands
 
@@ -62,6 +64,8 @@ taskctl run-now <id>
 taskctl history <id> --limit 20
 taskctl recent-failures --limit 20
 taskctl logs --lines 100
+taskctl logs --lines 100 --follow
+taskctl report daily --date 2026-03-12 --timezone Asia/Shanghai
 ```
 
 Machine-readable output:
@@ -69,7 +73,11 @@ Machine-readable output:
 ```bash
 taskctl --json list
 taskctl --json show <id>
+taskctl --json validate
 taskctl --json history <id>
+taskctl --json recent-failures --limit 20
+taskctl --json run-now <id>
+taskctl --json report daily --date 2026-03-12 --timezone Asia/Shanghai
 ```
 
 Meaning:
@@ -77,10 +85,11 @@ Meaning:
 - `list`: show all configured tasks with enabled status, schedule, and latest runtime status
 - `show <id>`: show one task, including config, latest runtime state, and most recent history row
 - `validate`: check YAML structure and task semantics without changing anything
-- `run-now <id>`: execute a task immediately outside its normal schedule
-- `history <id>`: show recent execution history for one task
-- `recent-failures`: show failed runs across all tasks
-- `logs --lines <N>`: show recent `taskd` service logs via `journalctl`
+- `run-now <id>`: execute a task immediately, record runtime state and history, optionally trigger notifications, and exit with the task's exit code
+- `history <id>`: show recent execution history for one task; default limit is `20`
+- `recent-failures`: show failed runs across all tasks; default limit is `20`
+- `logs --lines <N>`: show recent `taskd` service logs via `journalctl`; `--follow` streams continuously
+- `report daily`: build a daily summary from history for the requested `--date` and `--timezone`
 - Prefer `--json` when another agent needs to parse results reliably
 
 ## Common taskctl workflows
@@ -88,8 +97,8 @@ Meaning:
 Add or update tasks through the CLI:
 
 ```bash
-taskctl add-cron <id> <name> "<cron>" <program> -- --arg1 --arg2
-taskctl add-interval <id> <name> <seconds> <program> -- --arg1 --arg2
+taskctl add-cron [OPTIONS] <id> <name> "<expr>" <program> -- [args...]
+taskctl add-interval [OPTIONS] <id> <name> <seconds> <program> -- [args...]
 taskctl enable <id>
 taskctl disable <id>
 taskctl remove <id>
@@ -100,32 +109,32 @@ Important options for `add-cron` and `add-interval`:
 - positional `id`: unique task ID
 - positional `name`: human-readable task name
 - positional `program`: executable or script path
-- trailing `-- ...`: arguments passed to the target program
-- `--enabled`: whether the task starts enabled
+- trailing `-- [args...]`: arguments passed to the target program
+- new tasks are enabled by default; disable them afterward if needed
 - `--timezone <TZ>`: cron timezone; only for `add-cron`
-- `--max-running <1..3>`: max concurrent runs for the same task
-- `--concurrency-policy <allow|forbid|replace>`:
-  - `allow`: permit overlap up to `--max-running`
-  - `forbid`: skip new triggers while one run is active
-  - `replace`: cancel the old run and start the new one
+- `--max-running <1..3>`: max concurrent runs for the same task; default is `1`
+- `--concurrency-policy <allow|forbid|replace>`: overlap policy; default is `forbid`
 - `--workdir <PATH>`: working directory for the spawned process
 - `--timeout-seconds <N>`: kill the process if it exceeds the timeout
-- `--retry-max-attempts <N>`: retry count after the initial failed run
-- `--retry-delay-seconds <N>`: seconds between retries
+- `--retry-max-attempts <N>`: retry count after the initial failed run; default is `0`
+- `--retry-delay-seconds <N>`: seconds between retries; default is `1`
 - `--env KEY=VALUE`: environment variable; may be repeated
 
-Validate and execute:
+Cron expression details for `add-cron`:
 
-```bash
-taskctl validate
-taskctl run-now <id>
-```
+- The parser is `cron::Schedule::from_str` from the Rust `cron` crate
+- In this project, use 6-field cron by default: `second minute hour day-of-month month day-of-week`
+- A 7th `year` field is also accepted
+- Standard 5-field cron like `0 2 * * *` is invalid here
+- Valid examples:
+  - `0 0 2 * * *`
+  - `0/30 * * * * *`
 
 Task state management:
 
 - `enable <id>`: mark a task enabled in YAML
 - `disable <id>`: mark a task disabled in YAML
-- `remove <id>`: delete a task from YAML
+- `remove <id>`: delete a task from YAML and remove its runtime-state entry
 - After config edits, `taskd` will reload automatically when watching the config file
 
 ## Task model
@@ -172,22 +181,22 @@ On an installed host, verify:
 
 ```bash
 systemctl status taskd --no-pager
-taskctl list
+/opt/taskd/taskctl list
 journalctl -u taskd -n 100 --no-pager
 ```
 
 Expect:
 
 - `taskd.service` is active
-- `taskctl list` can read `/etc/taskd/tasks.yaml` without `--config`
+- `/opt/taskd/taskctl list` can read `/etc/taskd/tasks.yaml` without `--config`
 - logs show scheduler startup without config validation failures
 
 Quick debugging commands:
 
 ```bash
-taskctl validate
-taskctl show <id>
-taskctl history <id> --limit 20
-taskctl recent-failures --limit 20
-taskctl logs --lines 100
+/opt/taskd/taskctl validate
+/opt/taskd/taskctl show <id>
+/opt/taskd/taskctl history <id> --limit 20
+/opt/taskd/taskctl recent-failures --limit 20
+/opt/taskd/taskctl logs --lines 100
 ```
