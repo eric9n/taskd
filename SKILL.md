@@ -130,14 +130,12 @@ Task state management:
 
 ## Task model
 
-Each task is one of:
+Each task is:
 
 - `command`: single external command
-- `pipeline`: linear pipeline with 2 to 3 steps
 
 Important rules:
 
-- `command` and `pipeline` are mutually exclusive
 - concurrency policies: `forbid`, `allow`, `replace`
 - `max_running` is limited to `1..=3`
 - retry applies to daemon-triggered runs
@@ -147,10 +145,26 @@ Important rules:
 Practical implications:
 
 - `run-now` is useful for smoke tests and manual execution
-- `pipeline` is YAML-defined; CLI add commands create single-command tasks
 - use `forbid` for non-reentrant jobs
 - use `replace` for jobs where only the latest run matters
 - use `allow` only when overlap is safe
+
+## Notifications
+
+Notifications are optional and disabled by default.
+
+- The default sample config keeps:
+  - `notifications.enabled: false`
+- A task only sends notifications when both are true:
+  - top-level `notifications.enabled: true`
+  - the task defines `notify.result_source`
+- Supported `notify.result_source.kind` values are:
+  - `stdout`
+  - `file`
+- The global renderer is `pi`
+- `pi` is executed in `notifications.renderer.workdir`, so that directory's `AGENTS.md` and repo context apply
+- Discord delivery is sent as webhook JSON `content`
+- Messages longer than 2000 characters are truncated before sending
 
 ## Verification checklist
 

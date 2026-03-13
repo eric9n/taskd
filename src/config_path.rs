@@ -4,18 +4,9 @@ use std::path::{Path, PathBuf};
 
 const SYSTEM_CONFIG_PATH: &str = "/etc/taskd/tasks.yaml";
 const LOCAL_CONFIG_PATH: &str = "config/tasks.yaml";
-const SYSTEM_ARTIFACTS_CONFIG_PATH: &str = "/etc/taskd/artifacts.yaml";
-const LOCAL_ARTIFACTS_CONFIG_PATH: &str = "config/artifacts.yaml";
 
 pub fn default_config_path() -> PathBuf {
     resolve_default_config_path(Path::new(SYSTEM_CONFIG_PATH), Path::new(LOCAL_CONFIG_PATH))
-}
-
-pub fn default_artifacts_config_path() -> PathBuf {
-    resolve_default_config_path(
-        Path::new(SYSTEM_ARTIFACTS_CONFIG_PATH),
-        Path::new(LOCAL_ARTIFACTS_CONFIG_PATH),
-    )
 }
 
 pub(crate) fn resolve_default_config_path(system_path: &Path, local_path: &Path) -> PathBuf {

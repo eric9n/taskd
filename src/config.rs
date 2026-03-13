@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<NotificationsConfig>,
     #[serde(default)]
     pub tasks: Vec<TaskConfig>,
 }
@@ -21,6 +23,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: 1,
+            notifications: None,
             tasks: Vec::new(),
         }
     }
@@ -59,11 +62,14 @@ impl AppConfig {
             "unsupported config version {}",
             self.version
         );
+        if let Some(notifications) = &self.notifications {
+            notifications.validate("notifications")?;
+        }
 
         let mut seen = HashMap::new();
         for (index, task) in self.tasks.iter().enumerate() {
             let task_path = format!("tasks[{index}]");
-            task.validate(&task_path)?;
+            task.validate(&task_path, self.notifications.as_ref())?;
             if let Some(previous_index) = seen.insert(task.id.clone(), index) {
                 bail!(
                     "{}.id duplicates task id '{}' already used by tasks[{}].id",
@@ -120,13 +126,16 @@ pub struct TaskConfig {
     pub retry: RetryConfig,
     pub schedule: ScheduleConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<CommandConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pipeline: Option<PipelineConfig>,
+    pub notify: Option<TaskNotifyConfig>,
+    pub command: CommandConfig,
 }
 
 impl TaskConfig {
-    pub fn validate(&self, task_path: &str) -> Result<()> {
+    pub fn validate(
+        &self,
+        task_path: &str,
+        notifications: Option<&NotificationsConfig>,
+    ) -> Result<()> {
         ensure!(
             is_valid_task_id(&self.id),
             "{}.id must use only letters, digits, '-', '_' or '.'",
@@ -140,71 +149,170 @@ impl TaskConfig {
         self.concurrency.validate(task_path)?;
         self.retry.validate(task_path)?;
         self.schedule.validate(task_path)?;
-        match (&self.command, &self.pipeline) {
-            (Some(command), None) => command.validate(&format!("{task_path}.command"))?,
-            (None, Some(pipeline)) => pipeline.validate(task_path)?,
-            (Some(_), Some(_)) => bail!(
-                "{}.command and {}.pipeline are mutually exclusive",
-                task_path,
+        if let Some(notify) = &self.notify {
+            let notifications = notifications.ok_or_else(|| {
+                anyhow!(
+                    "{}.notify requires top-level notifications to be configured",
+                    task_path
+                )
+            })?;
+            notifications.validate(&format!("{task_path}.notifications_ref"))?;
+            ensure!(
+                notifications.enabled,
+                "{}.notify requires top-level notifications.enabled to be true",
                 task_path
-            ),
-            (None, None) => bail!(
-                "{}.command or {}.pipeline must be set",
-                task_path,
-                task_path
-            ),
+            );
+            notify.validate(task_path)?;
         }
+        self.command.validate(&format!("{task_path}.command"))?;
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PipelineConfig {
-    pub steps: Vec<PipelineStepConfig>,
+pub struct NotificationsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<PiRendererConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook: Option<WebhookConfig>,
 }
 
-impl PipelineConfig {
-    pub fn validate(&self, task_path: &str) -> Result<()> {
-        ensure!(
-            (2..=3).contains(&self.steps.len()),
-            "{}.pipeline.steps must contain between 2 and 3 steps",
-            task_path
-        );
+impl NotificationsConfig {
+    pub fn validate(&self, path: &str) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
 
-        let mut seen = HashMap::new();
-        for (index, step) in self.steps.iter().enumerate() {
-            let step_path = format!("{task_path}.pipeline.steps[{index}]");
-            step.validate(&step_path)?;
-            if let Some(previous_index) = seen.insert(step.id.clone(), index) {
-                bail!(
-                    "{}.id duplicates step id '{}' already used by {}.pipeline.steps[{}].id",
-                    step_path,
-                    step.id,
-                    task_path,
-                    previous_index
+        self.renderer
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}.renderer must be set when notifications.enabled is true",
+                    path
+                )
+            })?
+            .validate(&format!("{path}.renderer"))?;
+        self.webhook
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}.webhook must be set when notifications.enabled is true",
+                    path
+                )
+            })?
+            .validate(&format!("{path}.webhook"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PiRendererConfig {
+    #[serde(default = "default_pi_program")]
+    pub program: String,
+    pub workdir: PathBuf,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+}
+
+impl PiRendererConfig {
+    pub fn validate(&self, path: &str) -> Result<()> {
+        ensure!(
+            !self.program.trim().is_empty(),
+            "{}.program must not be empty",
+            path
+        );
+        ensure!(
+            !self.prompt.trim().is_empty(),
+            "{}.prompt must not be empty",
+            path
+        );
+        ensure!(
+            self.workdir.exists(),
+            "{}.workdir '{}' does not exist",
+            path,
+            self.workdir.display()
+        );
+        ensure!(
+            self.workdir.is_dir(),
+            "{}.workdir '{}' is not a directory",
+            path,
+            self.workdir.display()
+        );
+        if let Some(timeout_seconds) = self.timeout_seconds {
+            ensure!(timeout_seconds > 0, "{}.timeout_seconds must be > 0", path);
+        }
+        validate_optional_dir(&self.session_dir, &format!("{path}.session_dir"))?;
+        validate_optional_dir(&self.agent_dir, &format!("{path}.agent_dir"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebhookConfig {
+    pub url_env: String,
+}
+
+impl WebhookConfig {
+    pub fn validate(&self, path: &str) -> Result<()> {
+        ensure!(
+            !self.url_env.trim().is_empty(),
+            "{}.url_env must not be empty",
+            path
+        );
+        Ok(())
+    }
+}
+
+fn default_pi_program() -> String {
+    "/usr/bin/pi".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskNotifyConfig {
+    pub result_source: NotifyResultSourceConfig,
+}
+
+impl TaskNotifyConfig {
+    pub fn validate(&self, task_path: &str) -> Result<()> {
+        self.result_source
+            .validate(&format!("{task_path}.notify.result_source"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum NotifyResultSourceConfig {
+    Stdout,
+    File { path: PathBuf },
+}
+
+impl NotifyResultSourceConfig {
+    pub fn validate(&self, path: &str) -> Result<()> {
+        match self {
+            Self::Stdout => Ok(()),
+            Self::File { path: file_path } => {
+                ensure!(
+                    !file_path.as_os_str().is_empty(),
+                    "{}.path must not be empty",
+                    path
                 );
+                Ok(())
             }
         }
-
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PipelineStepConfig {
-    pub id: String,
-    pub command: CommandConfig,
-}
-
-impl PipelineStepConfig {
-    pub fn validate(&self, step_path: &str) -> Result<()> {
-        ensure!(
-            is_valid_task_id(&self.id),
-            "{}.id must use only letters, digits, '-', '_' or '.'",
-            step_path
-        );
-        self.command.validate(&format!("{step_path}.command"))?;
-        Ok(())
     }
 }
 
@@ -401,6 +509,21 @@ impl CommandConfig {
     }
 }
 
+fn validate_optional_dir(path: &Option<PathBuf>, field: &str) -> Result<()> {
+    if let Some(path) = path {
+        ensure!(!path.as_os_str().is_empty(), "{} must not be empty", field);
+        if path.exists() {
+            ensure!(
+                path.is_dir(),
+                "{} '{}' is not a directory",
+                field,
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn is_valid_task_id(id: &str) -> bool {
     !id.is_empty()
         && id
@@ -423,8 +546,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        AppConfig, CommandConfig, ConcurrencyConfig, ConcurrencyPolicy, PipelineConfig,
-        PipelineStepConfig, RetryConfig, ScheduleConfig, TaskConfig,
+        AppConfig, CommandConfig, ConcurrencyConfig, ConcurrencyPolicy, NotificationsConfig,
+        NotifyResultSourceConfig, PiRendererConfig, RetryConfig, ScheduleConfig, TaskConfig,
+        TaskNotifyConfig, WebhookConfig,
     };
 
     #[test]
@@ -467,6 +591,7 @@ tasks:
     fn rejects_duplicate_ids() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![sample_task("job"), sample_task("job")],
         };
 
@@ -481,6 +606,7 @@ tasks:
     fn rejects_invalid_interval() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
                 schedule: ScheduleConfig::Interval { seconds: 0 },
                 ..sample_task("job")
@@ -498,6 +624,7 @@ tasks:
     fn rejects_invalid_cron() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
                 schedule: ScheduleConfig::Cron {
                     expr: "not-a-cron".to_string(),
@@ -515,11 +642,12 @@ tasks:
     fn rejects_missing_workdir() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
-                command: Some(CommandConfig {
+                command: CommandConfig {
                     workdir: Some(PathBuf::from("/definitely/missing")),
-                    ..sample_task("job").command.expect("command")
-                }),
+                    ..sample_task("job").command
+                },
                 ..sample_task("job")
             }],
         };
@@ -532,11 +660,12 @@ tasks:
     fn rejects_invalid_timeout() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
-                command: Some(CommandConfig {
+                command: CommandConfig {
                     timeout_seconds: Some(0),
-                    ..sample_task("job").command.expect("command")
-                }),
+                    ..sample_task("job").command
+                },
                 ..sample_task("job")
             }],
         };
@@ -552,6 +681,7 @@ tasks:
     fn rejects_invalid_concurrency_limit() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
                 concurrency: ConcurrencyConfig {
                     policy: ConcurrencyPolicy::Allow,
@@ -574,6 +704,7 @@ tasks:
     fn rejects_retry_without_delay() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
                 retry: RetryConfig {
                     max_attempts: 2,
@@ -594,6 +725,7 @@ tasks:
     fn rejects_forbid_with_multiple_slots() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
                 concurrency: ConcurrencyConfig {
                     policy: ConcurrencyPolicy::Forbid,
@@ -617,6 +749,7 @@ tasks:
     fn rejects_replace_with_multiple_slots() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
                 concurrency: ConcurrencyConfig {
                     policy: ConcurrencyPolicy::Replace,
@@ -642,6 +775,7 @@ tasks:
         let path = dir.path().join("tasks.yaml");
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![sample_task("job")],
         };
 
@@ -668,11 +802,12 @@ tasks:
 
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
-                command: Some(CommandConfig {
+                command: CommandConfig {
                     workdir: Some(workdir),
-                    ..sample_task("job").command.expect("command")
-                }),
+                    ..sample_task("job").command
+                },
                 ..sample_task("job")
             }],
         };
@@ -681,66 +816,100 @@ tasks:
     }
 
     #[test]
-    fn validates_pipeline_with_three_steps() {
+    fn rejects_notify_without_top_level_notifications() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
-                command: None,
-                pipeline: Some(PipelineConfig {
-                    steps: vec![
-                        sample_step("step-1"),
-                        sample_step("step-2"),
-                        sample_step("step-3"),
-                    ],
-                }),
-                ..sample_task("pipeline-job")
-            }],
-        };
-
-        config.validate().expect("pipeline should validate");
-    }
-
-    #[test]
-    fn rejects_pipeline_with_more_than_three_steps() {
-        let config = AppConfig {
-            version: 1,
-            tasks: vec![TaskConfig {
-                command: None,
-                pipeline: Some(PipelineConfig {
-                    steps: vec![
-                        sample_step("step-1"),
-                        sample_step("step-2"),
-                        sample_step("step-3"),
-                        sample_step("step-4"),
-                    ],
-                }),
-                ..sample_task("pipeline-job")
-            }],
-        };
-
-        let err = config.validate().expect_err("pipeline size should fail");
-        assert!(
-            err.to_string()
-                .contains("tasks[0].pipeline.steps must contain between 2 and 3 steps")
-        );
-    }
-
-    #[test]
-    fn rejects_task_with_both_command_and_pipeline() {
-        let config = AppConfig {
-            version: 1,
-            tasks: vec![TaskConfig {
-                pipeline: Some(PipelineConfig {
-                    steps: vec![sample_step("step-1"), sample_step("step-2")],
+                notify: Some(TaskNotifyConfig {
+                    result_source: NotifyResultSourceConfig::Stdout,
                 }),
                 ..sample_task("job")
             }],
         };
 
-        let err = config.validate().expect_err("execution kind should fail");
+        let err = config
+            .validate()
+            .expect_err("notify should require global config");
         assert!(
             err.to_string()
-                .contains("tasks[0].command and tasks[0].pipeline are mutually exclusive")
+                .contains("tasks[0].notify requires top-level notifications to be configured")
+        );
+    }
+
+    #[test]
+    fn rejects_notification_renderer_without_workdir() {
+        let config = AppConfig {
+            version: 1,
+            notifications: Some(NotificationsConfig {
+                enabled: true,
+                renderer: Some(PiRendererConfig {
+                    program: "/usr/bin/pi".to_string(),
+                    workdir: PathBuf::from("/definitely/missing"),
+                    prompt: "summarize".to_string(),
+                    timeout_seconds: None,
+                    session_dir: None,
+                    agent_dir: None,
+                    provider: None,
+                    model: None,
+                    env: Default::default(),
+                }),
+                webhook: Some(WebhookConfig {
+                    url_env: "TASKD_WEBHOOK_URL".to_string(),
+                }),
+            }),
+            tasks: vec![sample_task("job")],
+        };
+
+        let err = config
+            .validate()
+            .expect_err("missing renderer workdir should fail");
+        assert!(
+            err.to_string()
+                .contains("notifications.renderer.workdir '/definitely/missing' does not exist")
+        );
+    }
+
+    #[test]
+    fn disabled_notifications_allow_missing_renderer_and_webhook() {
+        let config = AppConfig {
+            version: 1,
+            notifications: Some(NotificationsConfig {
+                enabled: false,
+                renderer: None,
+                webhook: None,
+            }),
+            tasks: vec![sample_task("job")],
+        };
+
+        config
+            .validate()
+            .expect("disabled notifications should validate");
+    }
+
+    #[test]
+    fn rejects_notify_when_notifications_are_disabled() {
+        let config = AppConfig {
+            version: 1,
+            notifications: Some(NotificationsConfig {
+                enabled: false,
+                renderer: None,
+                webhook: None,
+            }),
+            tasks: vec![TaskConfig {
+                notify: Some(TaskNotifyConfig {
+                    result_source: NotifyResultSourceConfig::Stdout,
+                }),
+                ..sample_task("job")
+            }],
+        };
+
+        let err = config
+            .validate()
+            .expect_err("notify should require enabled notifications");
+        assert!(
+            err.to_string()
+                .contains("tasks[0].notify requires top-level notifications.enabled to be true")
         );
     }
 
@@ -752,20 +921,7 @@ tasks:
             concurrency: ConcurrencyConfig::default(),
             retry: RetryConfig::default(),
             schedule: ScheduleConfig::Interval { seconds: 60 },
-            command: Some(CommandConfig {
-                program: "/bin/echo".to_string(),
-                args: vec!["ok".to_string()],
-                workdir: None,
-                timeout_seconds: None,
-                env: Default::default(),
-            }),
-            pipeline: None,
-        }
-    }
-
-    fn sample_step(id: &str) -> PipelineStepConfig {
-        PipelineStepConfig {
-            id: id.to_string(),
+            notify: None,
             command: CommandConfig {
                 program: "/bin/echo".to_string(),
                 args: vec!["ok".to_string()],

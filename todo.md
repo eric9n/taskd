@@ -158,12 +158,12 @@
 
 ## 可能的后续增强
 
-### 简单任务编排
-- [x] 支持简单线性 pipeline
-- [x] 单个 pipeline 最多 3 步
-- [x] 仅支持串行执行，不支持复杂 DAG
-- [x] 失败即中断后续步骤
-- [x] 展示每一步执行结果
+### 任务通知
+- [x] 全局配置 `pi` renderer
+- [x] 全局配置 Discord webhook
+- [x] 任务级可选 `notify`
+- [x] 支持 `stdout` / `file` 结果来源
+- [x] Discord 超长消息截断
 
 ---
 

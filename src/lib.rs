@@ -1,12 +1,11 @@
 //! Shared library entrypoints for the `taskd` daemon and `taskctl` control plane.
 
-pub mod artifact_cli;
-pub mod artifacts;
 pub mod cli;
 pub mod config;
 pub mod config_path;
 pub mod daemon_cli;
 pub mod history;
+pub mod notifications;
 pub mod runtime_paths;
 pub mod scheduler;
 pub mod state;
@@ -24,14 +23,14 @@ use serde::Serialize;
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
-use crate::artifact_cli::ArtifactCli;
 use crate::cli::{Cli, Command, ConcurrencyPolicyArg, ReportCommand};
 use crate::config::{
-    AppConfig, CommandConfig, ConcurrencyConfig, ConcurrencyPolicy, PipelineConfig, RetryConfig,
-    ScheduleConfig, TaskConfig,
+    AppConfig, CommandConfig, ConcurrencyConfig, ConcurrencyPolicy, RetryConfig, ScheduleConfig,
+    TaskConfig,
 };
 use crate::daemon_cli::{TaskdCli, TaskdCommand};
 use crate::history::{HistoryRecord, HistoryStore};
+use crate::notifications::maybe_send_task_notification;
 use crate::runtime_paths::last_good_config_path_for_config;
 use crate::state::{
     RuntimeStateStore, TaskRuntimeState, load_runtime_state, state_path_for_config,
@@ -68,21 +67,6 @@ pub async fn run_taskctl() -> i32 {
     }
 }
 
-pub async fn run_artifactctl() -> i32 {
-    if let Err(error) = init_tracing() {
-        eprintln!("failed to initialize logging: {error:#}");
-        return 1;
-    }
-
-    match try_run_artifactctl().await {
-        Ok(code) => code,
-        Err(error) => {
-            eprintln!("error: {error:#}");
-            1
-        }
-    }
-}
-
 async fn try_run_taskd() -> Result<i32> {
     let cli = TaskdCli::parse();
 
@@ -96,11 +80,6 @@ async fn try_run_taskd() -> Result<i32> {
             Ok(0)
         }
     }
-}
-
-async fn try_run_artifactctl() -> Result<i32> {
-    let cli = ArtifactCli::parse();
-    artifacts::run(cli).await
 }
 
 fn load_valid_daemon_config(config_path: &Path) -> Result<AppConfig> {
@@ -233,14 +212,14 @@ async fn try_run_taskctl() -> Result<i32> {
                     delay_seconds: retry_delay_seconds,
                 },
                 schedule: ScheduleConfig::Cron { expr, timezone },
-                command: Some(CommandConfig {
+                command: CommandConfig {
                     program,
                     args,
                     workdir,
                     timeout_seconds,
                     env: env.into_iter().collect(),
-                }),
-                pipeline: None,
+                },
+                notify: None,
             })?;
             app.validate()?;
             app.write(&cli.config)?;
@@ -275,14 +254,14 @@ async fn try_run_taskctl() -> Result<i32> {
                     delay_seconds: retry_delay_seconds,
                 },
                 schedule: ScheduleConfig::Interval { seconds },
-                command: Some(CommandConfig {
+                command: CommandConfig {
                     program,
                     args,
                     workdir,
                     timeout_seconds,
                     env: env.into_iter().collect(),
-                }),
-                pipeline: None,
+                },
+                notify: None,
             })?;
             app.validate()?;
             app.write(&cli.config)?;
@@ -384,6 +363,15 @@ async fn try_run_taskctl() -> Result<i32> {
             };
             RuntimeStateStore::from_config_path(&cli.config)?.record(&task.id, &outcome)?;
             HistoryStore::from_config_path(&cli.config)?.record(&task.id, &outcome)?;
+            if let Err(error) =
+                maybe_send_task_notification(app.notifications.as_ref(), &task, &outcome).await
+            {
+                tracing::error!(
+                    task_id = %task.id,
+                    error = %error,
+                    "failed to send task notification"
+                );
+            }
             if cli.json {
                 emit_json(&RunNowOutput {
                     task_id: task.id.clone(),
@@ -506,11 +494,7 @@ fn print_task_detail(
         task.retry.max_attempts, task.retry.delay_seconds
     );
     println!("schedule: {}", task.schedule.summary());
-    match (&task.command, &task.pipeline) {
-        (Some(command), None) => print_command_detail("command", command),
-        (None, Some(pipeline)) => print_pipeline_detail(pipeline),
-        _ => println!("execution: invalid"),
-    }
+    print_command_detail("command", &task.command);
 
     match runtime {
         Some(runtime) => {
@@ -598,14 +582,6 @@ fn print_command_detail(label: &str, command: &CommandConfig) {
             .collect::<Vec<_>>()
             .join(", ");
         println!("{label}.env: {env}");
-    }
-}
-
-fn print_pipeline_detail(pipeline: &PipelineConfig) {
-    println!("pipeline.steps: {}", pipeline.steps.len());
-    for step in &pipeline.steps {
-        println!("pipeline.step.id: {}", step.id);
-        print_command_detail(&format!("pipeline.step.{}", step.id), &step.command);
     }
 }
 
@@ -1001,6 +977,7 @@ mod daemon_config_tests {
     fn valid_config() -> AppConfig {
         AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![TaskConfig {
                 id: "health-check".to_string(),
                 name: "health check".to_string(),
@@ -1008,14 +985,14 @@ mod daemon_config_tests {
                 concurrency: Default::default(),
                 retry: Default::default(),
                 schedule: ScheduleConfig::Interval { seconds: 60 },
-                command: Some(CommandConfig {
+                notify: None,
+                command: CommandConfig {
                     program: "/bin/echo".to_string(),
                     args: vec!["ok".to_string()],
                     workdir: None,
                     timeout_seconds: None,
                     env: Default::default(),
-                }),
-                pipeline: None,
+                },
             }],
         }
     }

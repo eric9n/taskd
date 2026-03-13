@@ -8,12 +8,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio::time::{Duration, timeout};
 use tracing::{error, info, warn};
 
-use crate::config::{CommandConfig, PipelineConfig, TaskConfig};
+use crate::config::{CommandConfig, TaskConfig};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +45,8 @@ pub struct TaskOutcome {
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     steps: Vec<TaskStepResult>,
+    stdout: Option<String>,
+    stderr: Option<String>,
 }
 
 impl TaskOutcome {
@@ -62,6 +65,8 @@ impl TaskOutcome {
             started_at,
             finished_at,
             steps: Vec::new(),
+            stdout: None,
+            stderr: None,
         }
     }
 
@@ -75,6 +80,8 @@ impl TaskOutcome {
             started_at: now,
             finished_at: now,
             steps: Vec::new(),
+            stdout: None,
+            stderr: None,
         }
     }
 
@@ -118,6 +125,14 @@ impl TaskOutcome {
         &self.steps
     }
 
+    pub fn stdout(&self) -> Option<&str> {
+        self.stdout.as_deref()
+    }
+
+    pub fn stderr(&self) -> Option<&str> {
+        self.stderr.as_deref()
+    }
+
     fn with_retry_summary(mut self, attempts_run: u8) -> Self {
         if attempts_run > 1 {
             self.summary = if self.success() {
@@ -141,14 +156,7 @@ async fn run_task_with_optional_cancel(
     task: &TaskConfig,
     cancel: Option<&mut oneshot::Receiver<()>>,
 ) -> TaskOutcome {
-    match (&task.command, &task.pipeline) {
-        (Some(command), None) => run_single_command_task(task, command, cancel).await,
-        (None, Some(pipeline)) => run_pipeline_task(task, pipeline, cancel).await,
-        _ => TaskOutcome::panic(
-            &task.id,
-            "invalid task execution config: expected exactly one of command or pipeline",
-        ),
-    }
+    run_single_command_task(task, &task.command, cancel).await
 }
 
 pub async fn run_task_or_error(task: &TaskConfig) -> Result<()> {
@@ -197,6 +205,8 @@ async fn run_task_with_retry_and_optional_cancel(
                 started_at: Utc::now(),
                 finished_at: Utc::now(),
                 steps: Vec::new(),
+                stdout: None,
+                stderr: None,
             };
         }
     }
@@ -265,7 +275,12 @@ pub async fn run_task_or_error_guarded_with_cancel(
     }
 }
 
-fn outcome_from_exit_status(started_at: DateTime<Utc>, status: ExitStatus) -> TaskOutcome {
+fn outcome_from_exit_status(
+    started_at: DateTime<Utc>,
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+) -> TaskOutcome {
     let status_kind = if status.success() {
         TaskRunStatus::Success
     } else {
@@ -284,6 +299,8 @@ fn outcome_from_exit_status(started_at: DateTime<Utc>, status: ExitStatus) -> Ta
                 started_at,
                 finished_at: Utc::now(),
                 steps: Vec::new(),
+                stdout: Some(stdout),
+                stderr: Some(stderr),
             };
         }
         "terminated without an exit code".to_string()
@@ -297,6 +314,8 @@ fn outcome_from_exit_status(started_at: DateTime<Utc>, status: ExitStatus) -> Ta
         started_at,
         finished_at: Utc::now(),
         steps: Vec::new(),
+        stdout: Some(stdout),
+        stderr: Some(stderr),
     }
 }
 
@@ -370,64 +389,6 @@ async fn run_single_command_task(
     outcome
 }
 
-async fn run_pipeline_task(
-    task: &TaskConfig,
-    pipeline: &PipelineConfig,
-    mut cancel: Option<&mut oneshot::Receiver<()>>,
-) -> TaskOutcome {
-    let pipeline_started = Utc::now();
-    let mut steps = Vec::with_capacity(pipeline.steps.len());
-
-    for step in &pipeline.steps {
-        let outcome = run_command(task, Some(&step.id), &step.command, cancel.as_deref_mut()).await;
-        let step_result = TaskStepResult {
-            step_id: step.id.clone(),
-            status: outcome.status(),
-            summary: outcome.summary().to_string(),
-            started_at: outcome.started_at(),
-            finished_at: outcome.finished_at(),
-            exit_code: outcome.exit_code(),
-        };
-        steps.push(step_result);
-
-        if !outcome.success() {
-            let final_outcome = TaskOutcome {
-                status: outcome.status(),
-                summary: format_pipeline_summary(&steps, false, Some(&step.id)),
-                exit_status: None,
-                explicit_exit_code: Some(outcome.exit_code()),
-                started_at: steps
-                    .first()
-                    .map(|value| value.started_at)
-                    .unwrap_or(pipeline_started),
-                finished_at: outcome.finished_at(),
-                steps,
-            };
-            log_task_result(&task.id, &final_outcome);
-            return final_outcome;
-        }
-    }
-
-    let finished_at = steps
-        .last()
-        .map(|value| value.finished_at)
-        .unwrap_or(pipeline_started);
-    let final_outcome = TaskOutcome {
-        status: TaskRunStatus::Success,
-        summary: format_pipeline_summary(&steps, true, None),
-        exit_status: None,
-        explicit_exit_code: Some(0),
-        started_at: steps
-            .first()
-            .map(|value| value.started_at)
-            .unwrap_or(pipeline_started),
-        finished_at,
-        steps,
-    };
-    log_task_result(&task.id, &final_outcome);
-    final_outcome
-}
-
 async fn run_command(
     task: &TaskConfig,
     step_id: Option<&str>,
@@ -440,7 +401,7 @@ async fn run_command(
             task_id = %task.id,
             step_id = %step_id,
             command = %command.program,
-            "starting pipeline step"
+            "starting task step"
         ),
         None => info!(task_id = %task.id, command = %command.program, "starting task"),
     }
@@ -453,6 +414,8 @@ async fn run_command(
     for (key, value) in &command.env {
         child_command.env(key, value);
     }
+    child_command.stdout(std::process::Stdio::piped());
+    child_command.stderr(std::process::Stdio::piped());
 
     let mut child = match child_command.spawn() {
         Ok(child) => child,
@@ -465,12 +428,21 @@ async fn run_command(
                 started_at,
                 finished_at: Utc::now(),
                 steps: Vec::new(),
+                stdout: None,
+                stderr: None,
             };
         }
     };
 
-    match wait_for_child(&task.id, command.timeout_seconds, &mut child, cancel).await {
-        Ok(status) => outcome_from_exit_status(started_at, status),
+    let stdout_reader = tokio::spawn(read_optional_stream(child.stdout.take()));
+    let stderr_reader = tokio::spawn(read_optional_stream(child.stderr.take()));
+
+    let wait_result = wait_for_child(&task.id, command.timeout_seconds, &mut child, cancel).await;
+    let stdout = stdout_reader.await.unwrap_or_default();
+    let stderr = stderr_reader.await.unwrap_or_default();
+
+    match wait_result {
+        Ok(status) => outcome_from_exit_status(started_at, status, stdout, stderr),
         Err(TaskWaitError::TimedOut(timeout_seconds)) => TaskOutcome {
             status: TaskRunStatus::TimedOut,
             summary: format_timeout_error(&task.id, step_id, timeout_seconds),
@@ -479,6 +451,8 @@ async fn run_command(
             started_at,
             finished_at: Utc::now(),
             steps: Vec::new(),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
         },
         Err(TaskWaitError::Cancelled) => TaskOutcome {
             status: TaskRunStatus::Cancelled,
@@ -488,6 +462,8 @@ async fn run_command(
             started_at,
             finished_at: Utc::now(),
             steps: Vec::new(),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
         },
         Err(TaskWaitError::WaitFailed(error)) => TaskOutcome {
             status: TaskRunStatus::Error,
@@ -497,8 +473,24 @@ async fn run_command(
             started_at,
             finished_at: Utc::now(),
             steps: Vec::new(),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
         },
     }
+}
+
+async fn read_optional_stream<T>(stream: Option<T>) -> String
+where
+    T: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut stream) = stream else {
+        return String::new();
+    };
+    let mut bytes = Vec::new();
+    if stream.read_to_end(&mut bytes).await.is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn format_command_error(task_id: &str, step_id: Option<&str>, error: &str) -> String {
@@ -528,30 +520,6 @@ fn format_cancel_error(task_id: &str, step_id: Option<&str>) -> String {
             task_id, step_id
         ),
         None => format!("task '{}' cancelled by replace policy", task_id),
-    }
-}
-
-fn format_pipeline_summary(
-    steps: &[TaskStepResult],
-    success: bool,
-    failed_step: Option<&str>,
-) -> String {
-    let details = steps
-        .iter()
-        .map(|step| {
-            format!(
-                "{}={} ({})",
-                step.step_id,
-                format!("{:?}", step.status).to_lowercase(),
-                step.summary
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    match (success, failed_step) {
-        (true, _) => format!("pipeline succeeded; steps: {details}"),
-        (false, Some(step_id)) => format!("pipeline failed at step '{step_id}'; steps: {details}"),
-        (false, None) => format!("pipeline failed; steps: {details}"),
     }
 }
 
@@ -605,8 +573,7 @@ mod tests {
 
     use super::{TaskRunStatus, run_task, run_task_guarded, run_task_or_error};
     use crate::config::{
-        CommandConfig, ConcurrencyConfig, PipelineConfig, PipelineStepConfig, RetryConfig,
-        ScheduleConfig, TaskConfig,
+        CommandConfig, ConcurrencyConfig, RetryConfig, ScheduleConfig, TaskConfig,
     };
 
     #[tokio::test]
@@ -632,6 +599,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn captures_stdout_and_stderr_for_command_tasks() {
+        let task = sample_task(vec![
+            "-c".into(),
+            "printf 'hello'; printf 'warn' >&2".into(),
+        ]);
+
+        let outcome = run_task(&task).await;
+
+        assert_eq!(outcome.stdout(), Some("hello"));
+        assert_eq!(outcome.stderr(), Some("warn"));
+    }
+
+    #[tokio::test]
     async fn supports_workdir_and_env() {
         let dir = tempdir().expect("tempdir");
         let output = dir.path().join("output.txt");
@@ -642,7 +622,8 @@ mod tests {
             concurrency: ConcurrencyConfig::default(),
             retry: RetryConfig::default(),
             schedule: ScheduleConfig::Interval { seconds: 60 },
-            command: Some(CommandConfig {
+            notify: None,
+            command: CommandConfig {
                 program: "/bin/sh".to_string(),
                 args: vec![
                     "-c".to_string(),
@@ -651,8 +632,7 @@ mod tests {
                 workdir: Some(PathBuf::from(dir.path())),
                 timeout_seconds: None,
                 env: BTreeMap::from([("TASKD_VALUE".to_string(), "written".to_string())]),
-            }),
-            pipeline: None,
+            },
         };
 
         run_task_or_error(&task).await.expect("task should succeed");
@@ -664,10 +644,10 @@ mod tests {
     #[tokio::test]
     async fn missing_executable_returns_error_without_panicking() {
         let task = TaskConfig {
-            command: Some(CommandConfig {
+            command: CommandConfig {
                 program: "/definitely/missing/taskd-bin".to_string(),
-                ..sample_task(vec![]).command.expect("command")
-            }),
+                ..sample_task(vec![]).command
+            },
             ..sample_task(vec![])
         };
 
@@ -682,12 +662,10 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_long_running_command() {
         let task = TaskConfig {
-            command: Some(CommandConfig {
+            command: CommandConfig {
                 timeout_seconds: Some(1),
-                ..sample_task(vec!["-c".into(), "sleep 5".into()])
-                    .command
-                    .expect("command")
-            }),
+                ..sample_task(vec!["-c".into(), "sleep 5".into()]).command
+            },
             ..sample_task(vec!["-c".into(), "sleep 5".into()])
         };
 
@@ -708,77 +686,6 @@ mod tests {
         assert_eq!(outcome.summary(), "terminated by signal 9");
     }
 
-    #[tokio::test]
-    async fn pipeline_runs_steps_in_order() {
-        let dir = tempdir().expect("tempdir");
-        let output = dir.path().join("pipeline.txt");
-        let task = TaskConfig {
-            command: None,
-            pipeline: Some(PipelineConfig {
-                steps: vec![
-                    PipelineStepConfig {
-                        id: "step-1".to_string(),
-                        command: shell_command(format!("printf 'one\\n' >> {}", output.display())),
-                    },
-                    PipelineStepConfig {
-                        id: "step-2".to_string(),
-                        command: shell_command(format!("printf 'two\\n' >> {}", output.display())),
-                    },
-                ],
-            }),
-            ..sample_task(vec![])
-        };
-
-        let outcome = run_task(&task).await;
-
-        assert!(outcome.success());
-        assert_eq!(outcome.steps().len(), 2);
-        let body = std::fs::read_to_string(output).expect("output");
-        assert_eq!(body, "one\ntwo\n");
-    }
-
-    #[tokio::test]
-    async fn pipeline_stops_after_failed_step() {
-        let dir = tempdir().expect("tempdir");
-        let output = dir.path().join("pipeline.txt");
-        let task = TaskConfig {
-            command: None,
-            pipeline: Some(PipelineConfig {
-                steps: vec![
-                    PipelineStepConfig {
-                        id: "step-1".to_string(),
-                        command: shell_command(format!("printf 'one\\n' >> {}", output.display())),
-                    },
-                    PipelineStepConfig {
-                        id: "step-2".to_string(),
-                        command: shell_command("exit 7".to_string()),
-                    },
-                    PipelineStepConfig {
-                        id: "step-3".to_string(),
-                        command: shell_command(format!(
-                            "printf 'three\\n' >> {}",
-                            output.display()
-                        )),
-                    },
-                ],
-            }),
-            ..sample_task(vec![])
-        };
-
-        let outcome = run_task(&task).await;
-
-        assert_eq!(outcome.status(), TaskRunStatus::Failed);
-        assert_eq!(outcome.exit_code(), 7);
-        assert_eq!(outcome.steps().len(), 2);
-        assert!(
-            outcome
-                .summary()
-                .contains("pipeline failed at step 'step-2'")
-        );
-        let body = std::fs::read_to_string(output).expect("output");
-        assert_eq!(body, "one\n");
-    }
-
     fn sample_task(args: Vec<String>) -> TaskConfig {
         TaskConfig {
             id: "job".to_string(),
@@ -787,24 +694,14 @@ mod tests {
             concurrency: ConcurrencyConfig::default(),
             retry: RetryConfig::default(),
             schedule: ScheduleConfig::Interval { seconds: 60 },
-            command: Some(CommandConfig {
+            notify: None,
+            command: CommandConfig {
                 program: "/bin/sh".to_string(),
                 args,
                 workdir: None,
                 timeout_seconds: None,
                 env: BTreeMap::new(),
-            }),
-            pipeline: None,
-        }
-    }
-
-    fn shell_command(body: String) -> CommandConfig {
-        CommandConfig {
-            program: "/bin/sh".to_string(),
-            args: vec!["-c".to_string(), body],
-            workdir: None,
-            timeout_seconds: None,
-            env: BTreeMap::new(),
+            },
         }
     }
 }

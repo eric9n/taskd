@@ -15,8 +15,11 @@ use tokio_cron_scheduler::{Job, JobScheduler};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::config::{AppConfig, ConcurrencyPolicy, ScheduleConfig, TaskConfig};
+use crate::config::{
+    AppConfig, ConcurrencyPolicy, NotificationsConfig, ScheduleConfig, TaskConfig,
+};
 use crate::history::HistoryStore;
+use crate::notifications::maybe_send_task_notification;
 use crate::persist_last_good_config;
 use crate::state::RuntimeStateStore;
 use crate::task_runner;
@@ -43,6 +46,7 @@ pub async fn run_daemon(
     let mut registered_tasks = register_tasks(
         &scheduler,
         &current_config,
+        current_config.notifications.clone(),
         state_store.clone(),
         history_store.clone(),
     )
@@ -116,6 +120,7 @@ pub async fn run_daemon(
 pub async fn register_tasks(
     scheduler: &JobScheduler,
     config: &AppConfig,
+    notifications: Option<NotificationsConfig>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
 ) -> Result<HashMap<String, Uuid>> {
@@ -127,6 +132,7 @@ pub async fn register_tasks(
         register_task(
             scheduler,
             task.clone(),
+            notifications.clone(),
             state_store.clone(),
             history_store.clone(),
             &mut registered,
@@ -139,12 +145,13 @@ pub async fn register_tasks(
 async fn register_task(
     scheduler: &JobScheduler,
     task: TaskConfig,
+    notifications: Option<NotificationsConfig>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
     registered: &mut HashMap<String, Uuid>,
 ) -> Result<()> {
     let task_id = task.id.clone();
-    let job = job_for_task(task, state_store, history_store)?;
+    let job = job_for_task(task, notifications, state_store, history_store)?;
     let job_id = scheduler.add(job).await?;
     registered.insert(task_id, job_id);
     Ok(())
@@ -152,6 +159,7 @@ async fn register_task(
 
 fn job_for_task(
     task: TaskConfig,
+    notifications: Option<NotificationsConfig>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
 ) -> Result<Job> {
@@ -170,6 +178,7 @@ fn job_for_task(
                     move |_id, _lock| {
                         Box::pin(schedule_task(
                             task.clone(),
+                            notifications.clone(),
                             control.clone(),
                             state_store.clone(),
                             history_store.clone(),
@@ -179,6 +188,7 @@ fn job_for_task(
                 None => Ok(Job::new_async(expr.as_str(), move |_id, _lock| {
                     Box::pin(schedule_task(
                         task.clone(),
+                        notifications.clone(),
                         control.clone(),
                         state_store.clone(),
                         history_store.clone(),
@@ -193,6 +203,7 @@ fn job_for_task(
                 move |_id, _lock| {
                     Box::pin(schedule_task(
                         task.clone(),
+                        notifications.clone(),
                         control.clone(),
                         state_store.clone(),
                         history_store.clone(),
@@ -205,6 +216,7 @@ fn job_for_task(
 
 async fn schedule_task(
     task: std::sync::Arc<TaskConfig>,
+    notifications: Option<NotificationsConfig>,
     control: std::sync::Arc<TaskExecutionControl>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
@@ -215,11 +227,13 @@ async fn schedule_task(
             else {
                 return;
             };
-            let handle = spawn_scheduled_task(task, permit, state_store, history_store);
+            let handle =
+                spawn_scheduled_task(task, notifications, permit, state_store, history_store);
             drop(handle);
         }
         ConcurrencyPolicy::Replace => {
-            let handle = spawn_replace_task(task, control, state_store, history_store);
+            let handle =
+                spawn_replace_task(task, notifications, control, state_store, history_store);
             drop(handle);
         }
     }
@@ -245,6 +259,7 @@ fn try_acquire_task_slot(
 
 fn spawn_scheduled_task(
     task: std::sync::Arc<TaskConfig>,
+    notifications: Option<NotificationsConfig>,
     _permit: OwnedSemaphorePermit,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
@@ -260,6 +275,11 @@ fn spawn_scheduled_task(
         if let Err(error) = history_store.record(&task.id, &outcome) {
             tracing::error!(task_id = %task.id, error = %error, "failed to persist history");
         }
+        if let Err(error) =
+            maybe_send_task_notification(notifications.as_ref(), task.as_ref(), &outcome).await
+        {
+            tracing::error!(task_id = %task.id, error = %error, "failed to send task notification");
+        }
         if !outcome.success() {
             tracing::error!(task_id = %task.id, error = %outcome.summary(), "scheduled task failed");
         }
@@ -268,6 +288,7 @@ fn spawn_scheduled_task(
 
 fn spawn_replace_task(
     task: std::sync::Arc<TaskConfig>,
+    notifications: Option<NotificationsConfig>,
     control: std::sync::Arc<TaskExecutionControl>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
@@ -295,6 +316,11 @@ fn spawn_replace_task(
         }
         if let Err(error) = history_store.record(&task.id, &outcome) {
             tracing::error!(task_id = %task.id, error = %error, "failed to persist history");
+        }
+        if let Err(error) =
+            maybe_send_task_notification(notifications.as_ref(), task.as_ref(), &outcome).await
+        {
+            tracing::error!(task_id = %task.id, error = %error, "failed to send task notification");
         }
         if !outcome.success() {
             tracing::error!(task_id = %task.id, error = %outcome.summary(), "scheduled task failed");
@@ -358,7 +384,7 @@ async fn execute_scheduled_task(task: std::sync::Arc<TaskConfig>) {
         )
         .expect("history store"),
     );
-    let handle = spawn_scheduled_task(task, permit, state_store, history_store);
+    let handle = spawn_scheduled_task(task, None, permit, state_store, history_store);
     let _ = handle.await;
 }
 
@@ -458,6 +484,7 @@ async fn reload_if_needed(
                     scheduler,
                     registered_tasks,
                     plan,
+                    next_config.notifications.clone(),
                     state_store,
                     history_store,
                 )
@@ -545,6 +572,7 @@ async fn apply_reload_plan(
     scheduler: &JobScheduler,
     registered_tasks: &mut HashMap<String, Uuid>,
     plan: ReloadPlan,
+    notifications: Option<NotificationsConfig>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
 ) -> Result<()> {
@@ -558,6 +586,7 @@ async fn apply_reload_plan(
         register_task(
             scheduler,
             task,
+            notifications.clone(),
             state_store.clone(),
             history_store.clone(),
             registered_tasks,
@@ -596,6 +625,7 @@ mod tests {
     fn counts_only_enabled_tasks() {
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![
                 sample_task("job-1", true, ScheduleConfig::Interval { seconds: 30 }),
                 sample_task("job-2", false, ScheduleConfig::Interval { seconds: 30 }),
@@ -612,13 +642,14 @@ mod tests {
         let history_store = std::sync::Arc::new(test_history_store());
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![
                 sample_task("job-1", true, ScheduleConfig::Interval { seconds: 30 }),
                 sample_task("job-2", false, ScheduleConfig::Interval { seconds: 30 }),
             ],
         };
 
-        let count = register_tasks(&scheduler, &config, state_store, history_store)
+        let count = register_tasks(&scheduler, &config, None, state_store, history_store)
             .await
             .expect("register tasks");
 
@@ -632,6 +663,7 @@ mod tests {
         let history_store = std::sync::Arc::new(test_history_store());
         let config = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![sample_task(
                 "job-1",
                 true,
@@ -642,7 +674,7 @@ mod tests {
             )],
         };
 
-        let count = register_tasks(&scheduler, &config, state_store, history_store)
+        let count = register_tasks(&scheduler, &config, None, state_store, history_store)
             .await
             .expect("register tasks");
 
@@ -653,6 +685,7 @@ mod tests {
     fn reload_plan_adds_removes_and_updates_tasks_incrementally() {
         let current = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![
                 sample_task("keep", true, ScheduleConfig::Interval { seconds: 30 }),
                 sample_task("remove", true, ScheduleConfig::Interval { seconds: 30 }),
@@ -662,6 +695,7 @@ mod tests {
         };
         let next = AppConfig {
             version: 1,
+            notifications: None,
             tasks: vec![
                 sample_task("keep", true, ScheduleConfig::Interval { seconds: 30 }),
                 sample_task("update", true, ScheduleConfig::Interval { seconds: 60 }),
@@ -711,14 +745,14 @@ mod tests {
             concurrency: ConcurrencyConfig::default(),
             retry: RetryConfig::default(),
             schedule: ScheduleConfig::Interval { seconds: 30 },
-            command: Some(CommandConfig {
+            notify: None,
+            command: CommandConfig {
                 program: "/definitely/missing/taskd-bin".to_string(),
                 args: Vec::new(),
                 workdir: None,
                 timeout_seconds: None,
                 env: BTreeMap::new(),
-            }),
-            pipeline: None,
+            },
         });
 
         execute_scheduled_task(task).await;
@@ -738,7 +772,8 @@ mod tests {
                 delay_seconds: 1,
             },
             schedule: ScheduleConfig::Interval { seconds: 30 },
-            command: Some(CommandConfig {
+            notify: None,
+            command: CommandConfig {
                 program: "/bin/sh".to_string(),
                 args: vec![
                     "-c".to_string(),
@@ -750,8 +785,7 @@ mod tests {
                 workdir: None,
                 timeout_seconds: None,
                 env: BTreeMap::new(),
-            }),
-            pipeline: None,
+            },
         });
         let state_dir = tempdir().expect("tempdir");
         let history_dir = tempdir().expect("tempdir");
@@ -768,6 +802,7 @@ mod tests {
 
         let handle = spawn_scheduled_task(
             task.clone(),
+            None,
             permit,
             state_store.clone(),
             history_store.clone(),
@@ -805,12 +840,14 @@ mod tests {
                 .expect("permit");
         let first = spawn_scheduled_task(
             first_task,
+            None,
             first_permit,
             first_state_store,
             first_history_store,
         );
         let second = spawn_scheduled_task(
             second_task,
+            None,
             second_permit,
             second_state_store,
             second_history_store,
@@ -864,7 +901,8 @@ mod tests {
             },
             retry: RetryConfig::default(),
             schedule: ScheduleConfig::Interval { seconds: 30 },
-            command: Some(CommandConfig {
+            notify: None,
+            command: CommandConfig {
                 program: "/bin/sh".to_string(),
                 args: vec![
                     "-c".to_string(),
@@ -873,8 +911,7 @@ mod tests {
                 workdir: None,
                 timeout_seconds: None,
                 env: BTreeMap::new(),
-            }),
-            pipeline: None,
+            },
         });
         let control = std::sync::Arc::new(TaskExecutionControl {
             semaphore: std::sync::Arc::new(Semaphore::new(1)),
@@ -885,14 +922,15 @@ mod tests {
 
         schedule_task(
             task.clone(),
+            None,
             control.clone(),
             state_store.clone(),
             history_store.clone(),
         )
         .await;
         sleep(Duration::from_millis(100)).await;
-        schedule_task(task, control, state_store, history_store).await;
-        sleep(Duration::from_millis(1500)).await;
+        schedule_task(task, None, control, state_store, history_store).await;
+        sleep(Duration::from_millis(2500)).await;
 
         let body = fs::read_to_string(output).expect("output file");
         assert_eq!(body.lines().count(), 1);
@@ -906,14 +944,14 @@ mod tests {
             concurrency: ConcurrencyConfig::default(),
             retry: RetryConfig::default(),
             schedule,
-            command: Some(CommandConfig {
+            notify: None,
+            command: CommandConfig {
                 program: "/bin/echo".to_string(),
                 args: vec!["ok".to_string()],
                 workdir: None,
                 timeout_seconds: None,
                 env: BTreeMap::new(),
-            }),
-            pipeline: None,
+            },
         }
     }
 
@@ -932,14 +970,14 @@ mod tests {
             },
             retry: RetryConfig::default(),
             schedule: ScheduleConfig::Interval { seconds: 30 },
-            command: Some(CommandConfig {
+            notify: None,
+            command: CommandConfig {
                 program: "/bin/sh".to_string(),
                 args: vec!["-c".to_string(), body.to_string()],
                 workdir: None,
                 timeout_seconds: None,
                 env: BTreeMap::new(),
-            }),
-            pipeline: None,
+            },
         }
     }
 
