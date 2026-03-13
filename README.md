@@ -244,6 +244,8 @@ command:
 - 未变化的任务不会重复注册
 - 被删除或被禁用的任务会从 scheduler 中移除
 - 配置非法时会保留旧调度继续运行，并记录告警日志
+- 每次成功加载配置后，都会保存一份 last-known-good 快照
+- 如果 daemon 启动时发现当前配置非法，但存在 last-known-good 快照，会记录告警并继续使用该快照启动
 
 ## CLI Usage
 
@@ -399,6 +401,11 @@ journalctl -u taskd -f
 
 - `config/tasks.yaml` -> `config/tasks.state.yaml`
 - `/etc/taskd/tasks.yaml` -> `/var/lib/taskd/tasks.state.yaml`
+
+另外还会维护最近一次成功加载的配置快照：
+
+- `config/tasks.yaml` -> `config/tasks.last-good.yaml`
+- `/etc/taskd/tasks.yaml` -> `/var/lib/taskd/tasks.last-good.yaml`
 
 这份文件会记录每个任务最近一次运行的：
 

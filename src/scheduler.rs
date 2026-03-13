@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::config::{AppConfig, ConcurrencyPolicy, ScheduleConfig, TaskConfig};
 use crate::history::HistoryStore;
+use crate::persist_last_good_config;
 use crate::state::RuntimeStateStore;
 use crate::task_runner;
 
@@ -470,6 +471,7 @@ async fn reload_if_needed(
             } else {
                 info!("config changed but produced no scheduler changes");
             }
+            persist_last_good_config(config_path, &next_config)?;
             *current_config = next_config;
         }
         Err(error) => {

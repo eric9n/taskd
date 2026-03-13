@@ -10,6 +10,7 @@ pub mod scheduler;
 pub mod state;
 pub mod task_runner;
 
+use std::path::Path;
 use std::process::{self, Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::Serialize;
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Cli, Command, ConcurrencyPolicyArg};
@@ -26,6 +28,7 @@ use crate::config::{
 };
 use crate::daemon_cli::{TaskdCli, TaskdCommand};
 use crate::history::{HistoryRecord, HistoryStore};
+use crate::runtime_paths::last_good_config_path_for_config;
 use crate::state::{
     RuntimeStateStore, TaskRuntimeState, load_runtime_state, state_path_for_config,
 };
@@ -66,8 +69,7 @@ async fn try_run_taskd() -> Result<i32> {
 
     match cli.command {
         TaskdCommand::Daemon => {
-            let app = AppConfig::load(&cli.config)?;
-            app.validate()?;
+            let app = load_valid_daemon_config(&cli.config)?;
             let state_store =
                 std::sync::Arc::new(RuntimeStateStore::from_config_path(&cli.config)?);
             let history_store = std::sync::Arc::new(HistoryStore::from_config_path(&cli.config)?);
@@ -75,6 +77,48 @@ async fn try_run_taskd() -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+fn load_valid_daemon_config(config_path: &Path) -> Result<AppConfig> {
+    match load_and_validate_config(config_path) {
+        Ok(config) => {
+            persist_last_good_config(config_path, &config)?;
+            Ok(config)
+        }
+        Err(primary_error) => {
+            let fallback_path = last_good_config_path_for_config(config_path);
+            let fallback_config = load_and_validate_config(&fallback_path).with_context(|| {
+                format!(
+                    "primary config '{}' is invalid and no valid last-known-good config was found at '{}'",
+                    config_path.display(),
+                    fallback_path.display()
+                )
+            })?;
+            warn!(
+                config = %config_path.display(),
+                fallback = %fallback_path.display(),
+                error = %primary_error,
+                "primary config invalid, continuing with last-known-good config"
+            );
+            Ok(fallback_config)
+        }
+    }
+}
+
+fn load_and_validate_config(path: &Path) -> Result<AppConfig> {
+    let config = AppConfig::load(path)?;
+    config.validate()?;
+    Ok(config)
+}
+
+pub(crate) fn persist_last_good_config(config_path: &Path, config: &AppConfig) -> Result<()> {
+    let snapshot_path = last_good_config_path_for_config(config_path);
+    config.write(&snapshot_path).with_context(|| {
+        format!(
+            "failed to persist last-known-good config '{}'",
+            snapshot_path.display()
+        )
+    })
 }
 
 async fn try_run_taskctl() -> Result<i32> {
@@ -729,5 +773,83 @@ mod logs_tests {
                 "-f".to_string()
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod daemon_config_tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::{load_valid_daemon_config, persist_last_good_config};
+    use crate::config::{AppConfig, CommandConfig, ScheduleConfig, TaskConfig};
+
+    fn valid_config() -> AppConfig {
+        AppConfig {
+            version: 1,
+            tasks: vec![TaskConfig {
+                id: "health-check".to_string(),
+                name: "health check".to_string(),
+                enabled: true,
+                concurrency: Default::default(),
+                retry: Default::default(),
+                schedule: ScheduleConfig::Interval { seconds: 60 },
+                command: Some(CommandConfig {
+                    program: "/bin/echo".to_string(),
+                    args: vec!["ok".to_string()],
+                    workdir: None,
+                    timeout_seconds: None,
+                    env: Default::default(),
+                }),
+                pipeline: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn loads_primary_config_and_persists_last_good_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("tasks.yaml");
+        let config = valid_config();
+        config.write(&config_path).expect("write config");
+
+        let loaded = load_valid_daemon_config(&config_path).expect("load valid config");
+
+        assert_eq!(loaded, config);
+        assert!(
+            dir.path().join("tasks.last-good.yaml").exists(),
+            "expected snapshot to be persisted"
+        );
+    }
+
+    #[test]
+    fn falls_back_to_last_good_snapshot_when_primary_config_is_invalid() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("tasks.yaml");
+        let snapshot_config = valid_config();
+        persist_last_good_config(&config_path, &snapshot_config).expect("persist snapshot");
+        fs::write(
+            &config_path,
+            "version: 1\ntasks:\n  - id: broken\n    name: broken\n",
+        )
+        .expect("write invalid config");
+
+        let loaded = load_valid_daemon_config(&config_path).expect("fallback config");
+
+        assert_eq!(loaded, snapshot_config);
+    }
+
+    #[test]
+    fn returns_error_when_primary_config_is_invalid_and_no_snapshot_exists() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("tasks.yaml");
+        fs::write(&config_path, "version: nope").expect("write invalid config");
+
+        let error = load_valid_daemon_config(&config_path).expect_err("should fail");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("primary config"));
+        assert!(message.contains("last-known-good config"));
     }
 }
