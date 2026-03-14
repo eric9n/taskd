@@ -170,6 +170,7 @@ Notifications are optional and disabled by default.
 - Supported `notify.result_source.kind` values are:
   - `stdout`
   - `file`
+- If `notify.result_source` contains a JSON object with top-level `notify: false`, taskd skips sending the notification for that run
 - The global renderer is `pi`
 - `pi` is executed in `notifications.renderer.workdir`, so that directory's `AGENTS.md` and repo context apply
 - Discord delivery is sent as webhook JSON `content`

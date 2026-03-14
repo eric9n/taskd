@@ -171,6 +171,8 @@ tasks:
 
 `file.path` 可以是绝对路径，也可以是相对路径。相对路径会相对于任务 `command.workdir` 解析。
 
+如果 `notify.result_source` 读到的内容是一个 JSON object，并且顶层有 `notify: false`，则本次运行会跳过发送通知。没有这个字段时，保持现有行为，默认发送。
+
 通知配置示例：
 
 ```yaml
@@ -209,6 +211,15 @@ tasks:
       result_source:
         kind: file
         path: backup-report.txt
+```
+
+可选地，你也可以让任务结果自己决定本次是否通知，例如：
+
+```json
+{
+  "notify": false,
+  "summary": "routine success"
+}
 ```
 
 ## Renderer Behavior

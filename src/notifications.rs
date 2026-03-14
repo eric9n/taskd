@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
+use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
@@ -33,6 +34,10 @@ pub async fn maybe_send_task_notification(
     if !notifications.enabled {
         return Ok(());
     }
+    let task_result = load_task_result(task, outcome, &task_notify.result_source)?;
+    if !should_send_notification(&task_result)? {
+        return Ok(());
+    }
     let renderer = notifications.renderer.as_ref().ok_or_else(|| {
         anyhow!(
             "task '{}' requested notify but notifications.renderer is not configured",
@@ -45,8 +50,6 @@ pub async fn maybe_send_task_notification(
             task.id
         )
     })?;
-
-    let task_result = load_task_result(task, outcome, &task_notify.result_source)?;
     let temp_dir = notification_temp_dir(task)?;
     fs::create_dir_all(&temp_dir).with_context(|| {
         format!(
@@ -88,6 +91,26 @@ fn load_task_result(
                 )
             })
         }
+    }
+}
+
+fn should_send_notification(task_result: &str) -> Result<bool> {
+    let trimmed = task_result.trim();
+    if trimmed.is_empty() {
+        return Ok(true);
+    }
+
+    let parsed = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(_) => return Ok(true),
+    };
+    let Some(object) = parsed.as_object() else {
+        return Ok(true);
+    };
+    match object.get("notify") {
+        None => Ok(true),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => bail!("task notify result field 'notify' must be a boolean when present"),
     }
 }
 
@@ -349,6 +372,99 @@ mod tests {
             .await
             .expect_err("missing webhook env should fail");
         assert!(error.to_string().contains("webhook env"));
+    }
+
+    #[tokio::test]
+    async fn notification_skips_send_when_result_schema_sets_notify_false() {
+        let dir = tempdir().expect("tempdir");
+        let result_file = dir.path().join("result.json");
+        std::fs::write(
+            &result_file,
+            r#"{"notify":false,"summary":"routine success"}"#,
+        )
+        .expect("write result");
+
+        let task = TaskConfig {
+            id: "job".to_string(),
+            name: "job".to_string(),
+            enabled: true,
+            concurrency: ConcurrencyConfig::default(),
+            retry: RetryConfig::default(),
+            schedule: ScheduleConfig::Interval { seconds: 60 },
+            notify: Some(TaskNotifyConfig {
+                result_source: NotifyResultSourceConfig::File {
+                    path: PathBuf::from(&result_file),
+                },
+            }),
+            command: CommandConfig {
+                program: "/bin/echo".to_string(),
+                args: vec!["ok".to_string()],
+                workdir: None,
+                timeout_seconds: None,
+                env: BTreeMap::new(),
+            },
+        };
+        let notifications = NotificationsConfig {
+            enabled: true,
+            renderer: None,
+            webhook: None,
+        };
+        let outcome = TaskOutcome::synthetic(
+            TaskRunStatus::Success,
+            "exit code 0".to_string(),
+            0,
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+        );
+
+        maybe_send_task_notification(Some(&notifications), &task, &outcome)
+            .await
+            .expect("notify=false should skip sending");
+    }
+
+    #[tokio::test]
+    async fn notification_rejects_non_boolean_notify_field() {
+        let dir = tempdir().expect("tempdir");
+        let result_file = dir.path().join("result.json");
+        std::fs::write(&result_file, r#"{"notify":"no"}"#).expect("write result");
+
+        let task = TaskConfig {
+            id: "job".to_string(),
+            name: "job".to_string(),
+            enabled: true,
+            concurrency: ConcurrencyConfig::default(),
+            retry: RetryConfig::default(),
+            schedule: ScheduleConfig::Interval { seconds: 60 },
+            notify: Some(TaskNotifyConfig {
+                result_source: NotifyResultSourceConfig::File {
+                    path: PathBuf::from(&result_file),
+                },
+            }),
+            command: CommandConfig {
+                program: "/bin/echo".to_string(),
+                args: vec!["ok".to_string()],
+                workdir: None,
+                timeout_seconds: None,
+                env: BTreeMap::new(),
+            },
+        };
+        let notifications = NotificationsConfig {
+            enabled: true,
+            renderer: None,
+            webhook: None,
+        };
+        let outcome = TaskOutcome::synthetic(
+            TaskRunStatus::Success,
+            "exit code 0".to_string(),
+            0,
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+        );
+
+        let error = maybe_send_task_notification(Some(&notifications), &task, &outcome)
+            .await
+            .expect_err("non-boolean notify should fail");
+        assert!(error.to_string().contains("field 'notify' must be a boolean"));
     }
 
     #[test]
