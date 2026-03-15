@@ -13,6 +13,7 @@ description: taskd is a single-host scheduler daemon for managing cron and inter
 - Prefer the installed scheduler config when it exists at `/etc/taskd/tasks.yaml`
 - Use a repo-local config such as `./config/tasks.yaml` only when the task is explicitly about a local checkout or test setup
 - Do not assume any remote VPS, SSH hop, or host alias unless the user explicitly asks for remote operations
+- On an installed host, prefer `taskctl ...` without `--config`; only add `--config` when the user needs a non-default config path
 
 ## Command paths
 
@@ -52,6 +53,7 @@ taskd daemon --config /etc/taskd/tasks.yaml
 Meaning:
 
 - `taskd daemon`: start the background scheduler and config watcher
+- On an installed host, `taskd daemon` should resolve `/etc/taskd/tasks.yaml` automatically
 - Use this under `systemd` on a server, not as an interactive foreground tool unless debugging
 
 ## Control-plane commands
@@ -175,7 +177,8 @@ Notifications are optional and disabled by default.
 - `pi` is executed in `notifications.renderer.workdir`, so that directory's `AGENTS.md` and repo context apply
 - Discord delivery is sent as webhook JSON `content`
 - Messages longer than 2000 characters are truncated before sending
-- `taskctl run-now` does not inherit `systemd` service environment automatically, so notification smoke tests may need an explicit `TASKD_WEBHOOK_URL=... taskctl run-now <id>`
+- `taskctl run-now` now loads top-level `env_files` from the selected config path, so notification smoke tests can rely on `/etc/taskd/taskd.env` when `tasks.yaml` includes it
+- If the config does not define `env_files`, `taskctl run-now` still does not inherit the daemon's `systemd` environment automatically, so manual injection may still be needed
 
 ## Verification checklist
 
@@ -184,7 +187,7 @@ On an installed host, verify:
 ```bash
 systemctl status taskd --no-pager
 /opt/taskd/taskctl list
-journalctl -u taskd -n 100 --no-pager
+/opt/taskd/taskctl logs --lines 100
 ```
 
 Expect:
@@ -201,4 +204,10 @@ Quick debugging commands:
 /opt/taskd/taskctl history <id> --limit 20
 /opt/taskd/taskctl recent-failures --limit 20
 /opt/taskd/taskctl logs --lines 100
+```
+
+Fallback when `taskctl logs` is unavailable or you specifically need raw `journalctl` flags:
+
+```bash
+journalctl -u taskd -n 100 --no-pager
 ```
