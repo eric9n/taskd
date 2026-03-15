@@ -172,11 +172,15 @@ Notifications are optional and disabled by default.
 - Supported `notify.result_source.kind` values are:
   - `stdout`
   - `file`
-- If `notify.result_source` contains a JSON object with top-level `notify: false`, taskd skips sending the notification for that run
+- If `notify.result_source` contains a JSON object, taskd only sends a notification when top-level `notify: true` is present
+- If that JSON object omits `notify`, the run does not send a notification
+- That JSON object may also set top-level `format: content` or `format: embed`; when omitted, it defaults to `content`
 - The global renderer is `pi`
 - `pi` is executed in `notifications.renderer.workdir`, so that directory's `AGENTS.md` and repo context apply
-- Discord delivery is sent as webhook JSON `content`
-- Messages longer than 2000 characters are truncated before sending
+- Discord delivery is sent as webhook JSON `content` by default
+- `format: embed` wraps the rendered markdown into a Discord embed with task title, status color, footer, and timestamp
+- `content` messages longer than 2000 characters are truncated before sending
+- embed descriptions longer than 4096 characters are truncated before sending
 - `taskctl run-now` now loads top-level `env_files` from the selected config path, so notification smoke tests can rely on `/etc/taskd/taskd.env` when `tasks.yaml` includes it
 - If the config does not define `env_files`, `taskctl run-now` still does not inherit the daemon's `systemd` environment automatically, so manual injection may still be needed
 
