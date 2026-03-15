@@ -40,6 +40,7 @@ jobs:
           install -m 0755 target/release/taskd "dist/${PACKAGE_NAME}/bin/taskd"
           install -m 0755 target/release/taskctl "dist/${PACKAGE_NAME}/bin/taskctl"
           install -m 0644 config/tasks.yaml "dist/${PACKAGE_NAME}/config/tasks.yaml"
+          install -m 0644 config/taskd.env.example "dist/${PACKAGE_NAME}/config/taskd.env.example"
           install -m 0644 deploy/taskd.service "dist/${PACKAGE_NAME}/deploy/taskd.service"
           tar -C dist -czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
           sha256sum "${PACKAGE_NAME}.tar.gz" > "${PACKAGE_NAME}.tar.gz.sha256"
