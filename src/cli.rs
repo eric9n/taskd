@@ -67,7 +67,9 @@ pub enum Command {
         id: String,
         #[arg(help = "Human-readable task name")]
         name: String,
-        #[arg(help = "Cron expression in 6-field format by default (second minute hour day-of-month month day-of-week); optional 7th year field is also accepted")]
+        #[arg(
+            help = "Cron expression in 6-field format by default (second minute hour day-of-month month day-of-week); optional 7th year field is also accepted"
+        )]
         expr: String,
         #[arg(help = "Program or script to execute")]
         program: String,

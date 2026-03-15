@@ -1,4 +1,8 @@
 version: 1
+# To load shared environment variables, uncomment:
+# env_files:
+#   - /etc/taskd/taskd.env
+
 notifications:
   enabled: false
 

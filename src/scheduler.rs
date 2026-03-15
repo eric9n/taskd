@@ -1,6 +1,6 @@
 //! Scheduler wiring, task registration, and in-process concurrency control.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::SystemTime;
@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::{
-    AppConfig, ConcurrencyPolicy, NotificationsConfig, ScheduleConfig, TaskConfig,
+    AppConfig, ConcurrencyPolicy, LoadedConfig, NotificationsConfig, ScheduleConfig, TaskConfig,
 };
 use crate::history::HistoryStore;
 use crate::notifications::maybe_send_task_notification;
@@ -37,7 +37,7 @@ struct ReplaceState {
 
 pub async fn run_daemon(
     config_path: PathBuf,
-    config: AppConfig,
+    config: LoadedConfig,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
 ) -> Result<()> {
@@ -45,24 +45,27 @@ pub async fn run_daemon(
     let mut current_config = config;
     let mut registered_tasks = register_tasks(
         &scheduler,
-        &current_config,
-        current_config.notifications.clone(),
+        &current_config.app,
+        current_config.app.notifications.clone(),
+        current_config.env.clone(),
         state_store.clone(),
         history_store.clone(),
     )
     .await?;
     let config_path = normalize_watch_path(&config_path)?;
-    let mut last_seen_config_stamp = config_file_stamp(&config_path)?;
+    let mut last_seen_config_stamp =
+        config_inputs_stamp(&config_path, &current_config.resolved_env_files)?;
     let (watch_tx, mut watch_rx) = mpsc::unbounded_channel();
-    let watcher = match create_config_watcher(&config_path, watch_tx) {
+    let watched_paths = watched_paths(&config_path, &current_config.resolved_env_files);
+    let mut watcher = match create_config_watcher(&watched_paths, watch_tx) {
         Ok(watcher) => Some(watcher),
         Err(error) => {
             warn!(error = %error, "failed to start config watcher, falling back to polling only");
             None
         }
     };
-    let _watcher = watcher;
-    let mut watcher_active = _watcher.is_some();
+    let mut watcher_active = watcher.is_some();
+    let mut current_watched_paths = watched_paths;
     let mut poll_tick = tokio::time::interval(Duration::from_secs(300));
     poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -82,17 +85,19 @@ pub async fn run_daemon(
                     watcher_active = false;
                     continue;
                 };
-                if !event_targets_config_path(&event.paths, &config_path) {
+                if !event_targets_config_path(&event.paths, &current_watched_paths) {
                     continue;
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                drain_config_events(&mut watch_rx, &config_path).await;
+                drain_config_events(&mut watch_rx, &current_watched_paths).await;
                 reload_if_needed(
                     &scheduler,
                     &config_path,
                     &mut current_config,
                     &mut registered_tasks,
                     &mut last_seen_config_stamp,
+                    watcher.as_mut(),
+                    &mut current_watched_paths,
                     state_store.clone(),
                     history_store.clone(),
                 )
@@ -105,6 +110,8 @@ pub async fn run_daemon(
                     &mut current_config,
                     &mut registered_tasks,
                     &mut last_seen_config_stamp,
+                    watcher.as_mut(),
+                    &mut current_watched_paths,
                     state_store.clone(),
                     history_store.clone(),
                 )
@@ -121,6 +128,7 @@ pub async fn register_tasks(
     scheduler: &JobScheduler,
     config: &AppConfig,
     notifications: Option<NotificationsConfig>,
+    inherited_env: BTreeMap<String, String>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
 ) -> Result<HashMap<String, Uuid>> {
@@ -133,6 +141,7 @@ pub async fn register_tasks(
             scheduler,
             task.clone(),
             notifications.clone(),
+            inherited_env.clone(),
             state_store.clone(),
             history_store.clone(),
             &mut registered,
@@ -146,12 +155,19 @@ async fn register_task(
     scheduler: &JobScheduler,
     task: TaskConfig,
     notifications: Option<NotificationsConfig>,
+    inherited_env: BTreeMap<String, String>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
     registered: &mut HashMap<String, Uuid>,
 ) -> Result<()> {
     let task_id = task.id.clone();
-    let job = job_for_task(task, notifications, state_store, history_store)?;
+    let job = job_for_task(
+        task,
+        notifications,
+        inherited_env,
+        state_store,
+        history_store,
+    )?;
     let job_id = scheduler.add(job).await?;
     registered.insert(task_id, job_id);
     Ok(())
@@ -160,6 +176,7 @@ async fn register_task(
 fn job_for_task(
     task: TaskConfig,
     notifications: Option<NotificationsConfig>,
+    inherited_env: BTreeMap<String, String>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
 ) -> Result<Job> {
@@ -171,6 +188,7 @@ fn job_for_task(
     match task.schedule.clone() {
         ScheduleConfig::Cron { expr, timezone } => {
             let task = std::sync::Arc::new(task);
+            let inherited_env = std::sync::Arc::new(inherited_env);
             match timezone {
                 Some(timezone) => Ok(Job::new_async_tz(
                     expr.as_str(),
@@ -179,6 +197,7 @@ fn job_for_task(
                         Box::pin(schedule_task(
                             task.clone(),
                             notifications.clone(),
+                            inherited_env.clone(),
                             control.clone(),
                             state_store.clone(),
                             history_store.clone(),
@@ -189,6 +208,7 @@ fn job_for_task(
                     Box::pin(schedule_task(
                         task.clone(),
                         notifications.clone(),
+                        inherited_env.clone(),
                         control.clone(),
                         state_store.clone(),
                         history_store.clone(),
@@ -198,12 +218,14 @@ fn job_for_task(
         }
         ScheduleConfig::Interval { seconds } => {
             let task = std::sync::Arc::new(task);
+            let inherited_env = std::sync::Arc::new(inherited_env);
             Ok(Job::new_repeated_async(
                 Duration::from_secs(seconds),
                 move |_id, _lock| {
                     Box::pin(schedule_task(
                         task.clone(),
                         notifications.clone(),
+                        inherited_env.clone(),
                         control.clone(),
                         state_store.clone(),
                         history_store.clone(),
@@ -217,6 +239,7 @@ fn job_for_task(
 async fn schedule_task(
     task: std::sync::Arc<TaskConfig>,
     notifications: Option<NotificationsConfig>,
+    inherited_env: std::sync::Arc<BTreeMap<String, String>>,
     control: std::sync::Arc<TaskExecutionControl>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
@@ -227,13 +250,25 @@ async fn schedule_task(
             else {
                 return;
             };
-            let handle =
-                spawn_scheduled_task(task, notifications, permit, state_store, history_store);
+            let handle = spawn_scheduled_task(
+                task,
+                notifications,
+                inherited_env,
+                permit,
+                state_store,
+                history_store,
+            );
             drop(handle);
         }
         ConcurrencyPolicy::Replace => {
-            let handle =
-                spawn_replace_task(task, notifications, control, state_store, history_store);
+            let handle = spawn_replace_task(
+                task,
+                notifications,
+                inherited_env,
+                control,
+                state_store,
+                history_store,
+            );
             drop(handle);
         }
     }
@@ -260,12 +295,18 @@ fn try_acquire_task_slot(
 fn spawn_scheduled_task(
     task: std::sync::Arc<TaskConfig>,
     notifications: Option<NotificationsConfig>,
+    inherited_env: std::sync::Arc<BTreeMap<String, String>>,
     _permit: OwnedSemaphorePermit,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let outcome = match task_runner::run_task_with_retry_guarded(task.clone()).await {
+        let outcome = match task_runner::run_task_with_retry_guarded_and_env(
+            task.clone(),
+            inherited_env.clone(),
+        )
+        .await
+        {
             Ok(outcome) => outcome,
             Err(error) => task_runner::TaskOutcome::panic(&task.id, &error.to_string()),
         };
@@ -275,8 +316,13 @@ fn spawn_scheduled_task(
         if let Err(error) = history_store.record(&task.id, &outcome) {
             tracing::error!(task_id = %task.id, error = %error, "failed to persist history");
         }
-        if let Err(error) =
-            maybe_send_task_notification(notifications.as_ref(), task.as_ref(), &outcome).await
+        if let Err(error) = maybe_send_task_notification(
+            notifications.as_ref(),
+            task.as_ref(),
+            &outcome,
+            Some(inherited_env.as_ref()),
+        )
+        .await
         {
             tracing::error!(task_id = %task.id, error = %error, "failed to send task notification");
         }
@@ -289,6 +335,7 @@ fn spawn_scheduled_task(
 fn spawn_replace_task(
     task: std::sync::Arc<TaskConfig>,
     notifications: Option<NotificationsConfig>,
+    inherited_env: std::sync::Arc<BTreeMap<String, String>>,
     control: std::sync::Arc<TaskExecutionControl>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
@@ -302,8 +349,9 @@ fn spawn_replace_task(
         if !replace_request_is_current(control.clone(), generation).await {
             return;
         }
-        let outcome = match task_runner::run_task_with_retry_guarded_with_cancel(
+        let outcome = match task_runner::run_task_with_retry_guarded_and_env_with_cancel(
             task.clone(),
+            inherited_env.clone(),
             cancel_receiver,
         )
         .await
@@ -317,8 +365,13 @@ fn spawn_replace_task(
         if let Err(error) = history_store.record(&task.id, &outcome) {
             tracing::error!(task_id = %task.id, error = %error, "failed to persist history");
         }
-        if let Err(error) =
-            maybe_send_task_notification(notifications.as_ref(), task.as_ref(), &outcome).await
+        if let Err(error) = maybe_send_task_notification(
+            notifications.as_ref(),
+            task.as_ref(),
+            &outcome,
+            Some(inherited_env.as_ref()),
+        )
+        .await
         {
             tracing::error!(task_id = %task.id, error = %error, "failed to send task notification");
         }
@@ -384,7 +437,14 @@ async fn execute_scheduled_task(task: std::sync::Arc<TaskConfig>) {
         )
         .expect("history store"),
     );
-    let handle = spawn_scheduled_task(task, None, permit, state_store, history_store);
+    let handle = spawn_scheduled_task(
+        task,
+        None,
+        std::sync::Arc::new(BTreeMap::new()),
+        permit,
+        state_store,
+        history_store,
+    );
     let _ = handle.await;
 }
 
@@ -406,6 +466,9 @@ struct ConfigFileStamp {
     len: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigInputsStamp(Vec<(PathBuf, Option<ConfigFileStamp>)>);
+
 fn config_file_stamp(path: &Path) -> Result<Option<ConfigFileStamp>> {
     match std::fs::metadata(path) {
         Ok(metadata) => Ok(Some(ConfigFileStamp {
@@ -425,11 +488,31 @@ fn normalize_watch_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+fn config_inputs_stamp(config_path: &Path, env_files: &[PathBuf]) -> Result<ConfigInputsStamp> {
+    let mut paths = vec![config_path.to_path_buf()];
+    paths.extend(env_files.iter().cloned());
+    paths.sort();
+    paths.dedup();
+
+    let mut stamps = Vec::with_capacity(paths.len());
+    for path in paths {
+        stamps.push((path.clone(), config_file_stamp(&path)?));
+    }
+    Ok(ConfigInputsStamp(stamps))
+}
+
+fn watched_paths(config_path: &Path, env_files: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = vec![config_path.to_path_buf()];
+    paths.extend(env_files.iter().cloned());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
 fn create_config_watcher(
-    config_path: &Path,
+    watched_paths: &[PathBuf],
     watch_tx: mpsc::UnboundedSender<Event>,
 ) -> Result<RecommendedWatcher> {
-    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
     let mut watcher =
         notify::recommended_watcher(move |result: notify::Result<Event>| match result {
             Ok(event) => {
@@ -439,17 +522,46 @@ fn create_config_watcher(
                 warn!(error = %error, "config watcher error");
             }
         })?;
-    watcher.watch(parent, RecursiveMode::NonRecursive)?;
+    sync_watcher_paths(&mut watcher, &BTreeSet::new(), watched_paths)?;
     Ok(watcher)
 }
 
-fn event_targets_config_path(paths: &[PathBuf], config_path: &Path) -> bool {
-    paths.iter().any(|path| path == config_path)
+fn sync_watcher_paths(
+    watcher: &mut RecommendedWatcher,
+    current_paths: &BTreeSet<PathBuf>,
+    next_paths: &[PathBuf],
+) -> Result<BTreeSet<PathBuf>> {
+    let next_dirs = next_paths
+        .iter()
+        .map(|path| {
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        })
+        .collect::<BTreeSet<_>>();
+
+    for path in current_paths.difference(&next_dirs) {
+        watcher.unwatch(path)?;
+    }
+    for path in next_dirs.difference(current_paths) {
+        watcher.watch(path, RecursiveMode::NonRecursive)?;
+    }
+
+    Ok(next_dirs)
 }
 
-async fn drain_config_events(watch_rx: &mut mpsc::UnboundedReceiver<Event>, config_path: &Path) {
+fn event_targets_config_path(paths: &[PathBuf], watched_paths: &[PathBuf]) -> bool {
+    paths
+        .iter()
+        .any(|path| watched_paths.iter().any(|watched| watched == path))
+}
+
+async fn drain_config_events(
+    watch_rx: &mut mpsc::UnboundedReceiver<Event>,
+    watched_paths: &[PathBuf],
+) {
     while let Ok(event) = watch_rx.try_recv() {
-        if event_targets_config_path(&event.paths, config_path) {
+        if event_targets_config_path(&event.paths, watched_paths) {
             continue;
         }
     }
@@ -458,24 +570,29 @@ async fn drain_config_events(watch_rx: &mut mpsc::UnboundedReceiver<Event>, conf
 async fn reload_if_needed(
     scheduler: &JobScheduler,
     config_path: &Path,
-    current_config: &mut AppConfig,
+    current_config: &mut LoadedConfig,
     registered_tasks: &mut HashMap<String, Uuid>,
-    last_seen_config_stamp: &mut Option<ConfigFileStamp>,
+    last_seen_config_stamp: &mut ConfigInputsStamp,
+    watcher: Option<&mut RecommendedWatcher>,
+    current_watched_paths: &mut Vec<PathBuf>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
 ) -> Result<()> {
-    let next_stamp = config_file_stamp(config_path)?;
+    let next_stamp = config_inputs_stamp(config_path, &current_config.resolved_env_files)?;
     if next_stamp == *last_seen_config_stamp {
         return Ok(());
     }
-    *last_seen_config_stamp = next_stamp;
 
-    match AppConfig::load(config_path).and_then(|config| {
+    match LoadedConfig::load(config_path).and_then(|config| {
         config.validate()?;
         Ok(config)
     }) {
         Ok(next_config) => {
-            let plan = build_reload_plan(current_config, &next_config);
+            let force_reload_all = current_config.app.notifications
+                != next_config.app.notifications
+                || current_config.app.env_files != next_config.app.env_files
+                || current_config.env != next_config.env;
+            let plan = build_reload_plan(&current_config.app, &next_config.app, force_reload_all);
             if plan.has_changes() {
                 let removed_count = plan.remove.len();
                 let added_count = plan.add.len();
@@ -484,7 +601,8 @@ async fn reload_if_needed(
                     scheduler,
                     registered_tasks,
                     plan,
-                    next_config.notifications.clone(),
+                    next_config.app.notifications.clone(),
+                    next_config.env.clone(),
                     state_store,
                     history_store,
                 )
@@ -498,10 +616,26 @@ async fn reload_if_needed(
             } else {
                 info!("config changed but produced no scheduler changes");
             }
-            persist_last_good_config(config_path, &next_config)?;
+            let next_watched_paths = watched_paths(config_path, &next_config.resolved_env_files);
+            if let Some(watcher) = watcher {
+                let current_dirs = current_watched_paths
+                    .iter()
+                    .map(|path| {
+                        path.parent()
+                            .unwrap_or_else(|| Path::new("."))
+                            .to_path_buf()
+                    })
+                    .collect::<BTreeSet<_>>();
+                let _ = sync_watcher_paths(watcher, &current_dirs, &next_watched_paths)?;
+            }
+            *current_watched_paths = next_watched_paths;
+            persist_last_good_config(config_path, &next_config.app)?;
+            *last_seen_config_stamp =
+                config_inputs_stamp(config_path, &next_config.resolved_env_files)?;
             *current_config = next_config;
         }
         Err(error) => {
+            *last_seen_config_stamp = next_stamp;
             warn!(error = %error, "ignoring invalid config update");
         }
     }
@@ -522,7 +656,30 @@ impl ReloadPlan {
     }
 }
 
-fn build_reload_plan(current: &AppConfig, next: &AppConfig) -> ReloadPlan {
+fn build_reload_plan(current: &AppConfig, next: &AppConfig, force_reload_all: bool) -> ReloadPlan {
+    if force_reload_all {
+        return ReloadPlan {
+            remove: current
+                .tasks
+                .iter()
+                .filter(|task| task.enabled)
+                .map(|task| task.id.clone())
+                .collect(),
+            add: next
+                .tasks
+                .iter()
+                .filter(|task| task.enabled)
+                .cloned()
+                .collect(),
+            update: next
+                .tasks
+                .iter()
+                .filter(|task| task.enabled)
+                .map(|task| task.id.clone())
+                .collect(),
+        };
+    }
+
     let current_tasks = current
         .tasks
         .iter()
@@ -573,6 +730,7 @@ async fn apply_reload_plan(
     registered_tasks: &mut HashMap<String, Uuid>,
     plan: ReloadPlan,
     notifications: Option<NotificationsConfig>,
+    inherited_env: BTreeMap<String, String>,
     state_store: std::sync::Arc<RuntimeStateStore>,
     history_store: std::sync::Arc<HistoryStore>,
 ) -> Result<()> {
@@ -587,6 +745,7 @@ async fn apply_reload_plan(
             scheduler,
             task,
             notifications.clone(),
+            inherited_env.clone(),
             state_store.clone(),
             history_store.clone(),
             registered_tasks,
@@ -625,6 +784,7 @@ mod tests {
     fn counts_only_enabled_tasks() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![
                 sample_task("job-1", true, ScheduleConfig::Interval { seconds: 30 }),
@@ -642,6 +802,7 @@ mod tests {
         let history_store = std::sync::Arc::new(test_history_store());
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![
                 sample_task("job-1", true, ScheduleConfig::Interval { seconds: 30 }),
@@ -649,9 +810,16 @@ mod tests {
             ],
         };
 
-        let count = register_tasks(&scheduler, &config, None, state_store, history_store)
-            .await
-            .expect("register tasks");
+        let count = register_tasks(
+            &scheduler,
+            &config,
+            None,
+            BTreeMap::new(),
+            state_store,
+            history_store,
+        )
+        .await
+        .expect("register tasks");
 
         assert_eq!(count.len(), 1);
     }
@@ -663,6 +831,7 @@ mod tests {
         let history_store = std::sync::Arc::new(test_history_store());
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![sample_task(
                 "job-1",
@@ -674,9 +843,16 @@ mod tests {
             )],
         };
 
-        let count = register_tasks(&scheduler, &config, None, state_store, history_store)
-            .await
-            .expect("register tasks");
+        let count = register_tasks(
+            &scheduler,
+            &config,
+            None,
+            BTreeMap::new(),
+            state_store,
+            history_store,
+        )
+        .await
+        .expect("register tasks");
 
         assert_eq!(count.len(), 1);
     }
@@ -685,6 +861,7 @@ mod tests {
     fn reload_plan_adds_removes_and_updates_tasks_incrementally() {
         let current = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![
                 sample_task("keep", true, ScheduleConfig::Interval { seconds: 30 }),
@@ -695,6 +872,7 @@ mod tests {
         };
         let next = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![
                 sample_task("keep", true, ScheduleConfig::Interval { seconds: 30 }),
@@ -704,7 +882,7 @@ mod tests {
             ],
         };
 
-        let plan = build_reload_plan(&current, &next);
+        let plan = build_reload_plan(&current, &next, false);
 
         assert!(plan.remove.contains(&"remove".to_string()));
         assert!(plan.update.contains(&"update".to_string()));
@@ -722,7 +900,10 @@ mod tests {
             PathBuf::from("/tmp/taskd/tasks.yaml.tmp"),
         ];
 
-        assert!(event_targets_config_path(&paths, &config_path));
+        assert!(event_targets_config_path(
+            &paths,
+            std::slice::from_ref(&config_path)
+        ));
     }
 
     #[test]
@@ -733,7 +914,10 @@ mod tests {
             PathBuf::from("/tmp/taskd/other.yaml"),
         ];
 
-        assert!(!event_targets_config_path(&paths, &config_path));
+        assert!(!event_targets_config_path(
+            &paths,
+            std::slice::from_ref(&config_path)
+        ));
     }
 
     #[tokio::test]
@@ -803,6 +987,7 @@ mod tests {
         let handle = spawn_scheduled_task(
             task.clone(),
             None,
+            std::sync::Arc::new(BTreeMap::new()),
             permit,
             state_store.clone(),
             history_store.clone(),
@@ -841,6 +1026,7 @@ mod tests {
         let first = spawn_scheduled_task(
             first_task,
             None,
+            std::sync::Arc::new(BTreeMap::new()),
             first_permit,
             first_state_store,
             first_history_store,
@@ -848,6 +1034,7 @@ mod tests {
         let second = spawn_scheduled_task(
             second_task,
             None,
+            std::sync::Arc::new(BTreeMap::new()),
             second_permit,
             second_state_store,
             second_history_store,
@@ -923,13 +1110,22 @@ mod tests {
         schedule_task(
             task.clone(),
             None,
+            std::sync::Arc::new(BTreeMap::new()),
             control.clone(),
             state_store.clone(),
             history_store.clone(),
         )
         .await;
         sleep(Duration::from_millis(100)).await;
-        schedule_task(task, None, control, state_store, history_store).await;
+        schedule_task(
+            task,
+            None,
+            std::sync::Arc::new(BTreeMap::new()),
+            control,
+            state_store,
+            history_store,
+        )
+        .await;
         sleep(Duration::from_millis(2500)).await;
 
         let body = fs::read_to_string(output).expect("output file");

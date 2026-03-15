@@ -21,6 +21,7 @@ pub async fn maybe_send_task_notification(
     notifications: Option<&NotificationsConfig>,
     task: &TaskConfig,
     outcome: &TaskOutcome,
+    inherited_env: Option<&BTreeMap<String, String>>,
 ) -> Result<()> {
     let Some(task_notify) = &task.notify else {
         return Ok(());
@@ -68,8 +69,8 @@ pub async fn maybe_send_task_notification(
         )
     })?;
 
-    let rendered = run_pi_renderer(renderer, task, &input_path).await?;
-    send_webhook(&webhook.url_env, &rendered).await?;
+    let rendered = run_pi_renderer(renderer, task, &input_path, inherited_env).await?;
+    send_webhook(&webhook.url_env, &rendered, inherited_env).await?;
     let _ = fs::remove_dir_all(&temp_dir);
     Ok(())
 }
@@ -134,6 +135,7 @@ async fn run_pi_renderer(
     renderer: &PiRendererConfig,
     task: &TaskConfig,
     input_path: &Path,
+    inherited_env: Option<&BTreeMap<String, String>>,
 ) -> Result<String> {
     let mut command = Command::new(&renderer.program);
     command.current_dir(&renderer.workdir);
@@ -153,6 +155,9 @@ async fn run_pi_renderer(
     }
     command.arg(format!("@{}", input_path.display()));
     command.arg(&renderer.prompt);
+    if let Some(inherited_env) = inherited_env {
+        command.envs(inherited_env);
+    }
     for (key, value) in &renderer.env {
         command.env(key, value);
     }
@@ -198,9 +203,15 @@ async fn run_pi_renderer(
     )
 }
 
-async fn send_webhook(url_env: &str, body: &str) -> Result<()> {
-    let url =
-        std::env::var(url_env).with_context(|| format!("webhook env '{}' is not set", url_env))?;
+async fn send_webhook(
+    url_env: &str,
+    body: &str,
+    inherited_env: Option<&BTreeMap<String, String>>,
+) -> Result<()> {
+    let url = inherited_env
+        .and_then(|env| env.get(url_env).cloned())
+        .or_else(|| std::env::var(url_env).ok())
+        .with_context(|| format!("webhook env '{}' is not set", url_env))?;
     let payload = DiscordWebhookPayload {
         content: discord_content(body),
     };
@@ -368,7 +379,7 @@ mod tests {
             chrono::Utc::now(),
         );
 
-        let error = maybe_send_task_notification(Some(&notifications), &task, &outcome)
+        let error = maybe_send_task_notification(Some(&notifications), &task, &outcome, None)
             .await
             .expect_err("missing webhook env should fail");
         assert!(error.to_string().contains("webhook env"));
@@ -417,7 +428,7 @@ mod tests {
             chrono::Utc::now(),
         );
 
-        maybe_send_task_notification(Some(&notifications), &task, &outcome)
+        maybe_send_task_notification(Some(&notifications), &task, &outcome, None)
             .await
             .expect("notify=false should skip sending");
     }
@@ -461,10 +472,115 @@ mod tests {
             chrono::Utc::now(),
         );
 
-        let error = maybe_send_task_notification(Some(&notifications), &task, &outcome)
+        let error = maybe_send_task_notification(Some(&notifications), &task, &outcome, None)
             .await
             .expect_err("non-boolean notify should fail");
-        assert!(error.to_string().contains("field 'notify' must be a boolean"));
+        assert!(
+            error
+                .to_string()
+                .contains("field 'notify' must be a boolean")
+        );
+    }
+
+    #[tokio::test]
+    async fn notification_uses_loaded_env_before_process_env() {
+        let dir = tempdir().expect("tempdir");
+        let result_file = dir.path().join("result.txt");
+        std::fs::write(&result_file, "raw result").expect("write result");
+        let renderer = dir.path().join("renderer.sh");
+        std::fs::write(&renderer, "#!/bin/sh\nset -eu\nprintf 'rendered summary'\n")
+            .expect("write renderer");
+        #[cfg(unix)]
+        {
+            let mut perms = std::fs::metadata(&renderer)
+                .expect("metadata")
+                .permissions();
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&renderer, perms).expect("chmod");
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let read = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+                    .await
+                    .expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::io::AsyncWriteExt::write_all(
+                &mut stream,
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+            )
+            .await
+            .expect("write response");
+        });
+
+        let task = TaskConfig {
+            id: "job".to_string(),
+            name: "job".to_string(),
+            enabled: true,
+            concurrency: ConcurrencyConfig::default(),
+            retry: RetryConfig::default(),
+            schedule: ScheduleConfig::Interval { seconds: 60 },
+            notify: Some(TaskNotifyConfig {
+                result_source: NotifyResultSourceConfig::File {
+                    path: PathBuf::from(&result_file),
+                },
+            }),
+            command: CommandConfig {
+                program: "/bin/echo".to_string(),
+                args: vec!["ok".to_string()],
+                workdir: None,
+                timeout_seconds: None,
+                env: BTreeMap::new(),
+            },
+        };
+        let notifications = NotificationsConfig {
+            enabled: true,
+            renderer: Some(PiRendererConfig {
+                program: renderer.display().to_string(),
+                workdir: dir.path().to_path_buf(),
+                prompt: "summarize".to_string(),
+                timeout_seconds: None,
+                session_dir: None,
+                agent_dir: None,
+                provider: None,
+                model: None,
+                env: BTreeMap::new(),
+            }),
+            webhook: Some(WebhookConfig {
+                url_env: "TASKD_WEBHOOK_URL".to_string(),
+            }),
+        };
+        let inherited_env = BTreeMap::from([(
+            "TASKD_WEBHOOK_URL".to_string(),
+            format!("http://{addr}/webhook"),
+        )]);
+        let outcome = TaskOutcome::synthetic(
+            TaskRunStatus::Success,
+            "exit code 0".to_string(),
+            0,
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+        );
+
+        maybe_send_task_notification(Some(&notifications), &task, &outcome, Some(&inherited_env))
+            .await
+            .expect("notification should use loaded env");
+        server.await.expect("server join");
     }
 
     #[test]

@@ -90,6 +90,7 @@ cargo build --release
 - 下载 release 包
 - 安装 `taskd` / `taskctl` 到 `/opt/taskd`
 - 安装默认配置到 `/etc/taskd/tasks.yaml`
+- 安装环境变量示例到 `/etc/taskd/taskd.env.example`
 - 安装并启动 `systemd` 服务
 
 默认安装不会启用通知，只会写入：
@@ -111,6 +112,9 @@ sudo ./deploy/install.sh
 
 ```yaml
 version: 1
+# To load shared environment variables, uncomment:
+# env_files:
+#   - /etc/taskd/taskd.env
 
 notifications:
   enabled: false
@@ -177,6 +181,8 @@ tasks:
 
 ```yaml
 version: 1
+env_files:
+  - /etc/taskd/taskd.env
 
 notifications:
   enabled: true
@@ -213,6 +219,8 @@ tasks:
         path: backup-report.txt
 ```
 
+`env_files` 里的文件按顺序加载，后面的同名变量会覆盖前面的值；任务级 `command.env` 和通知级 `renderer.env` 仍然有更高优先级。
+
 可选地，你也可以让任务结果自己决定本次是否通知，例如：
 
 ```json
@@ -248,14 +256,18 @@ tasks:
 
 如果你要真正开启通知，最小步骤是：
 
-1. 把顶层 `notifications.enabled` 改成 `true`
-2. 配置 `notifications.renderer`
-3. 配置 `notifications.webhook`
-4. 给目标任务增加 `notify.result_source`
+1. 参考 `/etc/taskd/taskd.env.example` 创建 `/etc/taskd/taskd.env`
+2. 把顶层 `notifications.enabled` 改成 `true`
+3. 配置 `notifications.renderer`
+4. 配置 `notifications.webhook`
+5. 给目标任务增加 `notify.result_source`
 
 最小示例：
 
 ```yaml
+env_files:
+  - /etc/taskd/taskd.env
+
 notifications:
   enabled: true
   renderer:

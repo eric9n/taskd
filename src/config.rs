@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_files: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notifications: Option<NotificationsConfig>,
     #[serde(default)]
@@ -23,10 +25,18 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedConfig {
+    pub app: AppConfig,
+    pub env: BTreeMap<String, String>,
+    pub resolved_env_files: Vec<PathBuf>,
 }
 
 impl AppConfig {
@@ -112,6 +122,27 @@ impl AppConfig {
             .ok_or_else(|| anyhow!("task '{id}' not found"))?;
         task.enabled = enabled;
         Ok(())
+    }
+}
+
+impl LoadedConfig {
+    pub fn load(config_path: &Path) -> Result<Self> {
+        let app = AppConfig::load(config_path)?;
+        Self::from_app(config_path, app)
+    }
+
+    pub fn from_app(config_path: &Path, app: AppConfig) -> Result<Self> {
+        let resolved_env_files = resolve_env_file_paths(config_path, &app.env_files)?;
+        let env = load_env_files(&resolved_env_files)?;
+        Ok(Self {
+            app,
+            env,
+            resolved_env_files,
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.app.validate()
     }
 }
 
@@ -524,11 +555,127 @@ fn validate_optional_dir(path: &Option<PathBuf>, field: &str) -> Result<()> {
     Ok(())
 }
 
+fn resolve_env_file_paths(config_path: &Path, env_files: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let base_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let cwd = std::env::current_dir().context("failed to resolve current directory")?;
+    env_files
+        .iter()
+        .map(|path| {
+            let resolved = if path.is_absolute() {
+                path.clone()
+            } else {
+                base_dir.join(path)
+            };
+            if resolved.is_absolute() {
+                Ok(resolved)
+            } else {
+                Ok(cwd.join(resolved))
+            }
+        })
+        .collect()
+}
+
+fn load_env_files(paths: &[PathBuf]) -> Result<BTreeMap<String, String>> {
+    let mut env = BTreeMap::new();
+    for path in paths {
+        let file_env = parse_env_file(path)?;
+        env.extend(file_env);
+    }
+    Ok(env)
+}
+
+fn parse_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read env file '{}'", path.display()))?;
+    let mut env = BTreeMap::new();
+    for (index, line) in raw.lines().enumerate() {
+        let line_no = index + 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let trimmed = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let (key, value) = trimmed.split_once('=').ok_or_else(|| {
+            anyhow!(
+                "invalid env line '{}:{}', expected KEY=VALUE",
+                path.display(),
+                line_no
+            )
+        })?;
+        let key = key.trim();
+        ensure!(
+            is_valid_env_key(key),
+            "invalid env key '{}' in '{}:{}'",
+            key,
+            path.display(),
+            line_no
+        );
+        let value = parse_env_value(value.trim(), path, line_no)?;
+        env.insert(key.to_string(), value);
+    }
+    Ok(env)
+}
+
+fn parse_env_value(value: &str, path: &Path, line_no: usize) -> Result<String> {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        return parse_double_quoted_env_value(&value[1..value.len() - 1], path, line_no);
+    }
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        return Ok(value[1..value.len() - 1].to_string());
+    }
+    Ok(value.to_string())
+}
+
+fn parse_double_quoted_env_value(value: &str, path: &Path, line_no: usize) -> Result<String> {
+    let mut parsed = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            parsed.push(ch);
+            continue;
+        }
+        let escaped = chars.next().ok_or_else(|| {
+            anyhow!(
+                "invalid trailing escape in '{}:{}'",
+                path.display(),
+                line_no
+            )
+        })?;
+        match escaped {
+            'n' => parsed.push('\n'),
+            'r' => parsed.push('\r'),
+            't' => parsed.push('\t'),
+            '\\' => parsed.push('\\'),
+            '"' => parsed.push('"'),
+            other => {
+                bail!(
+                    "unsupported escape '\\{}' in '{}:{}'",
+                    other,
+                    path.display(),
+                    line_no
+                );
+            }
+        }
+    }
+    Ok(parsed)
+}
+
 fn is_valid_task_id(id: &str) -> bool {
     !id.is_empty()
         && id
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.chars().enumerate().all(|(index, ch)| {
+            if index == 0 {
+                ch.is_ascii_alphabetic() || ch == '_'
+            } else {
+                ch.is_ascii_alphanumeric() || ch == '_'
+            }
+        })
 }
 
 fn is_missing_file_error(error: &anyhow::Error) -> bool {
@@ -546,9 +693,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        AppConfig, CommandConfig, ConcurrencyConfig, ConcurrencyPolicy, NotificationsConfig,
-        NotifyResultSourceConfig, PiRendererConfig, RetryConfig, ScheduleConfig, TaskConfig,
-        TaskNotifyConfig, WebhookConfig,
+        AppConfig, CommandConfig, ConcurrencyConfig, ConcurrencyPolicy, LoadedConfig,
+        NotificationsConfig, NotifyResultSourceConfig, PiRendererConfig, RetryConfig,
+        ScheduleConfig, TaskConfig, TaskNotifyConfig, WebhookConfig,
     };
 
     #[test]
@@ -591,6 +738,7 @@ tasks:
     fn rejects_duplicate_ids() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![sample_task("job"), sample_task("job")],
         };
@@ -606,6 +754,7 @@ tasks:
     fn rejects_invalid_interval() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 schedule: ScheduleConfig::Interval { seconds: 0 },
@@ -624,6 +773,7 @@ tasks:
     fn rejects_invalid_cron() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 schedule: ScheduleConfig::Cron {
@@ -642,6 +792,7 @@ tasks:
     fn rejects_missing_workdir() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 command: CommandConfig {
@@ -660,6 +811,7 @@ tasks:
     fn rejects_invalid_timeout() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 command: CommandConfig {
@@ -681,6 +833,7 @@ tasks:
     fn rejects_invalid_concurrency_limit() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 concurrency: ConcurrencyConfig {
@@ -704,6 +857,7 @@ tasks:
     fn rejects_retry_without_delay() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 retry: RetryConfig {
@@ -725,6 +879,7 @@ tasks:
     fn rejects_forbid_with_multiple_slots() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 concurrency: ConcurrencyConfig {
@@ -749,6 +904,7 @@ tasks:
     fn rejects_replace_with_multiple_slots() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 concurrency: ConcurrencyConfig {
@@ -775,6 +931,7 @@ tasks:
         let path = dir.path().join("tasks.yaml");
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![sample_task("job")],
         };
@@ -802,6 +959,7 @@ tasks:
 
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 command: CommandConfig {
@@ -819,6 +977,7 @@ tasks:
     fn rejects_notify_without_top_level_notifications() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 notify: Some(TaskNotifyConfig {
@@ -841,6 +1000,7 @@ tasks:
     fn rejects_notification_renderer_without_workdir() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: Some(NotificationsConfig {
                 enabled: true,
                 renderer: Some(PiRendererConfig {
@@ -874,6 +1034,7 @@ tasks:
     fn disabled_notifications_allow_missing_renderer_and_webhook() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: Some(NotificationsConfig {
                 enabled: false,
                 renderer: None,
@@ -891,6 +1052,7 @@ tasks:
     fn rejects_notify_when_notifications_are_disabled() {
         let config = AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: Some(NotificationsConfig {
                 enabled: false,
                 renderer: None,
@@ -911,6 +1073,49 @@ tasks:
             err.to_string()
                 .contains("tasks[0].notify requires top-level notifications.enabled to be true")
         );
+    }
+
+    #[test]
+    fn loaded_config_resolves_env_files_relative_to_config_path() {
+        let dir = tempdir().expect("tempdir");
+        let env_path = dir.path().join("notifications.env");
+        let config_path = dir.path().join("tasks.yaml");
+        fs::write(
+            &env_path,
+            "TASKD_WEBHOOK_URL=https://example.com\nexport TASKD_CHANNEL=alerts\n",
+        )
+        .expect("write env file");
+        fs::write(
+            &config_path,
+            "version: 1\nenv_files:\n  - notifications.env\ntasks: []\n",
+        )
+        .expect("write config");
+
+        let loaded = LoadedConfig::load(&config_path).expect("load resolved config");
+
+        assert_eq!(
+            loaded.env.get("TASKD_WEBHOOK_URL"),
+            Some(&"https://example.com".to_string())
+        );
+        assert_eq!(loaded.env.get("TASKD_CHANNEL"), Some(&"alerts".to_string()));
+        assert_eq!(loaded.resolved_env_files, vec![env_path]);
+    }
+
+    #[test]
+    fn loaded_config_rejects_invalid_env_line() {
+        let dir = tempdir().expect("tempdir");
+        let env_path = dir.path().join("notifications.env");
+        let config_path = dir.path().join("tasks.yaml");
+        fs::write(&env_path, "BROKEN LINE\n").expect("write env file");
+        fs::write(
+            &config_path,
+            "version: 1\nenv_files:\n  - notifications.env\ntasks: []\n",
+        )
+        .expect("write config");
+
+        let error = LoadedConfig::load(&config_path).expect_err("invalid env should fail");
+
+        assert!(error.to_string().contains("expected KEY=VALUE"));
     }
 
     fn sample_task(id: &str) -> TaskConfig {

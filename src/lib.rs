@@ -25,8 +25,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Cli, Command, ConcurrencyPolicyArg, ReportCommand};
 use crate::config::{
-    AppConfig, CommandConfig, ConcurrencyConfig, ConcurrencyPolicy, RetryConfig, ScheduleConfig,
-    TaskConfig,
+    AppConfig, CommandConfig, ConcurrencyConfig, ConcurrencyPolicy, LoadedConfig, RetryConfig,
+    ScheduleConfig, TaskConfig,
 };
 use crate::daemon_cli::{TaskdCli, TaskdCommand};
 use crate::history::{HistoryRecord, HistoryStore};
@@ -82,21 +82,30 @@ async fn try_run_taskd() -> Result<i32> {
     }
 }
 
-fn load_valid_daemon_config(config_path: &Path) -> Result<AppConfig> {
+fn load_valid_daemon_config(config_path: &Path) -> Result<LoadedConfig> {
     match load_and_validate_config(config_path) {
         Ok(config) => {
-            persist_last_good_config(config_path, &config)?;
+            persist_last_good_config(config_path, &config.app)?;
             Ok(config)
         }
         Err(primary_error) => {
             let fallback_path = last_good_config_path_for_config(config_path);
-            let fallback_config = load_and_validate_config(&fallback_path).with_context(|| {
+            let fallback_app = AppConfig::load(&fallback_path).with_context(|| {
                 format!(
                     "primary config '{}' is invalid and no valid last-known-good config was found at '{}'",
                     config_path.display(),
                     fallback_path.display()
                 )
             })?;
+            let fallback_config =
+                LoadedConfig::from_app(config_path, fallback_app).with_context(|| {
+                    format!(
+                        "primary config '{}' is invalid and no valid last-known-good config was found at '{}'",
+                        config_path.display(),
+                        fallback_path.display()
+                    )
+                })?;
+            fallback_config.validate()?;
             warn!(
                 config = %config_path.display(),
                 fallback = %fallback_path.display(),
@@ -108,8 +117,8 @@ fn load_valid_daemon_config(config_path: &Path) -> Result<AppConfig> {
     }
 }
 
-fn load_and_validate_config(path: &Path) -> Result<AppConfig> {
-    let config = AppConfig::load(path)?;
+fn load_and_validate_config(path: &Path) -> Result<LoadedConfig> {
+    let config = LoadedConfig::load(path)?;
     config.validate()?;
     Ok(config)
 }
@@ -129,8 +138,8 @@ async fn try_run_taskctl() -> Result<i32> {
 
     match cli.command {
         Command::List => {
-            let app = AppConfig::load(&cli.config)?;
-            app.validate()?;
+            let loaded = load_and_validate_config(&cli.config)?;
+            let app = &loaded.app;
             let state = load_runtime_state(&state_path_for_config(&cli.config))?;
             if cli.json {
                 emit_json(&ListOutput {
@@ -146,8 +155,8 @@ async fn try_run_taskctl() -> Result<i32> {
             Ok(0)
         }
         Command::Show { id } => {
-            let app = AppConfig::load(&cli.config)?;
-            app.validate()?;
+            let loaded = load_and_validate_config(&cli.config)?;
+            let app = &loaded.app;
             let task = app
                 .task(&id)
                 .with_context(|| format!("task '{id}' not found"))?;
@@ -169,8 +178,8 @@ async fn try_run_taskctl() -> Result<i32> {
             Ok(0)
         }
         Command::Validate => {
-            let app = AppConfig::load(&cli.config)?;
-            app.validate()?;
+            let loaded = load_and_validate_config(&cli.config)?;
+            let app = &loaded.app;
             if cli.json {
                 emit_json(&ValidateOutput {
                     ok: true,
@@ -268,7 +277,7 @@ async fn try_run_taskctl() -> Result<i32> {
             Ok(0)
         }
         Command::Remove { id } => {
-            let mut app = AppConfig::load(&cli.config)?;
+            let mut app = load_and_validate_config(&cli.config)?.app;
             let removed = app.remove_task(&id)?;
             app.validate()?;
             app.write(&cli.config)?;
@@ -285,7 +294,7 @@ async fn try_run_taskctl() -> Result<i32> {
             Ok(0)
         }
         Command::Enable { id } => {
-            let mut app = AppConfig::load(&cli.config)?;
+            let mut app = load_and_validate_config(&cli.config)?.app;
             app.set_enabled(&id, true)?;
             app.validate()?;
             app.write(&cli.config)?;
@@ -301,7 +310,7 @@ async fn try_run_taskctl() -> Result<i32> {
             Ok(0)
         }
         Command::Disable { id } => {
-            let mut app = AppConfig::load(&cli.config)?;
+            let mut app = load_and_validate_config(&cli.config)?.app;
             app.set_enabled(&id, false)?;
             app.validate()?;
             app.write(&cli.config)?;
@@ -351,20 +360,31 @@ async fn try_run_taskctl() -> Result<i32> {
             }
         }
         Command::RunNow { id } => {
-            let app = AppConfig::load(&cli.config)?;
-            app.validate()?;
+            let loaded = load_and_validate_config(&cli.config)?;
+            let app = &loaded.app;
             let task = app
                 .task(&id)
                 .with_context(|| format!("task '{id}' not found"))?
                 .clone();
-            let outcome = match task_runner::run_task_guarded(Arc::new(task.clone())).await {
+            let inherited_env = Arc::new(loaded.env.clone());
+            let outcome = match task_runner::run_task_guarded_with_env(
+                Arc::new(task.clone()),
+                inherited_env.clone(),
+            )
+            .await
+            {
                 Ok(outcome) => outcome,
                 Err(error) => TaskOutcome::panic(&task.id, &error.to_string()),
             };
             RuntimeStateStore::from_config_path(&cli.config)?.record(&task.id, &outcome)?;
             HistoryStore::from_config_path(&cli.config)?.record(&task.id, &outcome)?;
-            if let Err(error) =
-                maybe_send_task_notification(app.notifications.as_ref(), &task, &outcome).await
+            if let Err(error) = maybe_send_task_notification(
+                app.notifications.as_ref(),
+                &task,
+                &outcome,
+                Some(inherited_env.as_ref()),
+            )
+            .await
             {
                 tracing::error!(
                     task_id = %task.id,
@@ -979,6 +999,7 @@ mod daemon_config_tests {
     fn valid_config() -> AppConfig {
         AppConfig {
             version: 1,
+            env_files: Vec::new(),
             notifications: None,
             tasks: vec![TaskConfig {
                 id: "health-check".to_string(),
@@ -1008,7 +1029,7 @@ mod daemon_config_tests {
 
         let loaded = load_valid_daemon_config(&config_path).expect("load valid config");
 
-        assert_eq!(loaded, config);
+        assert_eq!(loaded.app, config);
         assert!(
             dir.path().join("tasks.last-good.yaml").exists(),
             "expected snapshot to be persisted"
@@ -1029,7 +1050,7 @@ mod daemon_config_tests {
 
         let loaded = load_valid_daemon_config(&config_path).expect("fallback config");
 
-        assert_eq!(loaded, snapshot_config);
+        assert_eq!(loaded.app, snapshot_config);
     }
 
     #[test]

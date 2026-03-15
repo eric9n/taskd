@@ -1,5 +1,6 @@
 //! External command execution, timeout handling, and guarded task outcomes.
 
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
@@ -149,14 +150,22 @@ impl TaskOutcome {
 }
 
 pub async fn run_task(task: &TaskConfig) -> TaskOutcome {
-    run_task_with_optional_cancel(task, None).await
+    run_task_with_env(task, None).await
+}
+
+pub async fn run_task_with_env(
+    task: &TaskConfig,
+    inherited_env: Option<&BTreeMap<String, String>>,
+) -> TaskOutcome {
+    run_task_with_optional_cancel(task, inherited_env, None).await
 }
 
 async fn run_task_with_optional_cancel(
     task: &TaskConfig,
+    inherited_env: Option<&BTreeMap<String, String>>,
     cancel: Option<&mut oneshot::Receiver<()>>,
 ) -> TaskOutcome {
-    run_single_command_task(task, &task.command, cancel).await
+    run_single_command_task(task, &task.command, inherited_env, cancel).await
 }
 
 pub async fn run_task_or_error(task: &TaskConfig) -> Result<()> {
@@ -169,17 +178,26 @@ pub async fn run_task_or_error(task: &TaskConfig) -> Result<()> {
 }
 
 pub async fn run_task_with_retry(task: &TaskConfig) -> TaskOutcome {
-    run_task_with_retry_and_optional_cancel(task, None).await
+    run_task_with_retry_and_env(task, None).await
+}
+
+pub async fn run_task_with_retry_and_env(
+    task: &TaskConfig,
+    inherited_env: Option<&BTreeMap<String, String>>,
+) -> TaskOutcome {
+    run_task_with_retry_and_optional_cancel(task, inherited_env, None).await
 }
 
 async fn run_task_with_retry_and_optional_cancel(
     task: &TaskConfig,
+    inherited_env: Option<&BTreeMap<String, String>>,
     mut cancel: Option<&mut oneshot::Receiver<()>>,
 ) -> TaskOutcome {
     let total_attempts = task.retry.max_attempts.saturating_add(1);
 
     for attempt in 1..=total_attempts {
-        let outcome = run_task_with_optional_cancel(task, cancel.as_deref_mut()).await;
+        let outcome =
+            run_task_with_optional_cancel(task, inherited_env, cancel.as_deref_mut()).await;
         if !should_retry(task, &outcome, attempt) {
             return outcome.with_retry_summary(attempt);
         }
@@ -221,6 +239,18 @@ pub async fn run_task_guarded(task: Arc<TaskConfig>) -> Result<TaskOutcome> {
         .map_err(|error| anyhow!("task '{}' panicked: {}", task_id, error))
 }
 
+pub async fn run_task_guarded_with_env(
+    task: Arc<TaskConfig>,
+    inherited_env: Arc<BTreeMap<String, String>>,
+) -> Result<TaskOutcome> {
+    let task_id = task.id.clone();
+    tokio::spawn(
+        async move { run_task_with_env(task.as_ref(), Some(inherited_env.as_ref())).await },
+    )
+    .await
+    .map_err(|error| anyhow!("task '{}' panicked: {}", task_id, error))
+}
+
 pub async fn run_task_guarded_with_cancel(
     task: Arc<TaskConfig>,
     cancel: oneshot::Receiver<()>,
@@ -228,7 +258,26 @@ pub async fn run_task_guarded_with_cancel(
     let task_id = task.id.clone();
     tokio::spawn(async move {
         let mut cancel = cancel;
-        run_task_with_optional_cancel(task.as_ref(), Some(&mut cancel)).await
+        run_task_with_optional_cancel(task.as_ref(), None, Some(&mut cancel)).await
+    })
+    .await
+    .map_err(|error| anyhow!("task '{}' panicked: {}", task_id, error))
+}
+
+pub async fn run_task_guarded_with_env_and_cancel(
+    task: Arc<TaskConfig>,
+    inherited_env: Arc<BTreeMap<String, String>>,
+    cancel: oneshot::Receiver<()>,
+) -> Result<TaskOutcome> {
+    let task_id = task.id.clone();
+    tokio::spawn(async move {
+        let mut cancel = cancel;
+        run_task_with_optional_cancel(
+            task.as_ref(),
+            Some(inherited_env.as_ref()),
+            Some(&mut cancel),
+        )
+        .await
     })
     .await
     .map_err(|error| anyhow!("task '{}' panicked: {}", task_id, error))
@@ -241,6 +290,18 @@ pub async fn run_task_with_retry_guarded(task: Arc<TaskConfig>) -> Result<TaskOu
         .map_err(|error| anyhow!("task '{}' panicked: {}", task_id, error))
 }
 
+pub async fn run_task_with_retry_guarded_and_env(
+    task: Arc<TaskConfig>,
+    inherited_env: Arc<BTreeMap<String, String>>,
+) -> Result<TaskOutcome> {
+    let task_id = task.id.clone();
+    tokio::spawn(async move {
+        run_task_with_retry_and_env(task.as_ref(), Some(inherited_env.as_ref())).await
+    })
+    .await
+    .map_err(|error| anyhow!("task '{}' panicked: {}", task_id, error))
+}
+
 pub async fn run_task_with_retry_guarded_with_cancel(
     task: Arc<TaskConfig>,
     cancel: oneshot::Receiver<()>,
@@ -248,7 +309,26 @@ pub async fn run_task_with_retry_guarded_with_cancel(
     let task_id = task.id.clone();
     tokio::spawn(async move {
         let mut cancel = cancel;
-        run_task_with_retry_and_optional_cancel(task.as_ref(), Some(&mut cancel)).await
+        run_task_with_retry_and_optional_cancel(task.as_ref(), None, Some(&mut cancel)).await
+    })
+    .await
+    .map_err(|error| anyhow!("task '{}' panicked: {}", task_id, error))
+}
+
+pub async fn run_task_with_retry_guarded_and_env_with_cancel(
+    task: Arc<TaskConfig>,
+    inherited_env: Arc<BTreeMap<String, String>>,
+    cancel: oneshot::Receiver<()>,
+) -> Result<TaskOutcome> {
+    let task_id = task.id.clone();
+    tokio::spawn(async move {
+        let mut cancel = cancel;
+        run_task_with_retry_and_optional_cancel(
+            task.as_ref(),
+            Some(inherited_env.as_ref()),
+            Some(&mut cancel),
+        )
+        .await
     })
     .await
     .map_err(|error| anyhow!("task '{}' panicked: {}", task_id, error))
@@ -382,9 +462,10 @@ async fn wait_for_child(
 async fn run_single_command_task(
     task: &TaskConfig,
     command: &CommandConfig,
+    inherited_env: Option<&BTreeMap<String, String>>,
     cancel: Option<&mut oneshot::Receiver<()>>,
 ) -> TaskOutcome {
-    let outcome = run_command(task, None, command, cancel).await;
+    let outcome = run_command(task, None, command, inherited_env, cancel).await;
     log_task_result(&task.id, &outcome);
     outcome
 }
@@ -393,6 +474,7 @@ async fn run_command(
     task: &TaskConfig,
     step_id: Option<&str>,
     command: &CommandConfig,
+    inherited_env: Option<&BTreeMap<String, String>>,
     cancel: Option<&mut oneshot::Receiver<()>>,
 ) -> TaskOutcome {
     let started_at = Utc::now();
@@ -410,6 +492,9 @@ async fn run_command(
     child_command.args(&command.args);
     if let Some(workdir) = &command.workdir {
         child_command.current_dir(workdir);
+    }
+    if let Some(inherited_env) = inherited_env {
+        child_command.envs(inherited_env);
     }
     for (key, value) in &command.env {
         child_command.env(key, value);

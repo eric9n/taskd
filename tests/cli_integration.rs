@@ -207,6 +207,52 @@ tasks:
 }
 
 #[test]
+fn run_now_loads_env_files_for_task_execution() {
+    let dir = tempdir().expect("tempdir");
+    let config = dir.path().join("tasks.yaml");
+    let env_file = dir.path().join("taskd.env");
+    let output = dir.path().join("output.txt");
+    fs::write(&env_file, "TASKD_VALUE=from-env-file\n").expect("write env file");
+    fs::write(
+        &config,
+        format!(
+            r#"
+version: 1
+env_files:
+  - {}
+tasks:
+  - id: env-job
+    name: env job
+    enabled: true
+    schedule:
+      kind: interval
+      seconds: 10
+    command:
+      program: /bin/sh
+      args:
+        - -c
+        - printf '%s' "$TASKD_VALUE" > {}
+"#,
+            env_file.display(),
+            output.display()
+        ),
+    )
+    .expect("write config");
+
+    let mut cmd = Command::cargo_bin("taskctl").expect("binary");
+    cmd.arg("--config")
+        .arg(&config)
+        .arg("run-now")
+        .arg("env-job");
+
+    cmd.assert().success();
+    assert_eq!(
+        fs::read_to_string(output).expect("output file"),
+        "from-env-file"
+    );
+}
+
+#[test]
 fn validate_rejects_zero_timeout() {
     let dir = tempdir().expect("tempdir");
     let config = dir.path().join("tasks.yaml");
