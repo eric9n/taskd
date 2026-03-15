@@ -87,7 +87,7 @@ install_files() {
   if [[ ! -f "${CONFIG_DIR}/tasks.yaml" ]]; then
     install -m 0644 "${root}/config/tasks.yaml" "${CONFIG_DIR}/tasks.yaml"
   fi
-  if [[ ! -f "${CONFIG_DIR}/taskd.env.example" ]]; then
+  if [[ -f "${root}/config/taskd.env.example" && ! -f "${CONFIG_DIR}/taskd.env.example" ]]; then
     install -m 0644 "${root}/config/taskd.env.example" "${CONFIG_DIR}/taskd.env.example"
   fi
 
