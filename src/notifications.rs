@@ -11,11 +11,38 @@ use tokio::process::Command;
 use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
-use crate::config::{NotificationsConfig, NotifyResultSourceConfig, PiRendererConfig, TaskConfig};
+use crate::config::{
+    NotificationsConfig, NotifyResultSourceConfig, PiRendererConfig, TaskConfig, WebhookConfig,
+};
 use crate::task_runner::{TaskOutcome, TaskRunStatus, TaskStepResult};
 
 const DISCORD_CONTENT_LIMIT: usize = 2000;
 const DISCORD_TRUNCATED_SUFFIX: &str = "\n\n[truncated]";
+const DISCORD_EMBED_TITLE_LIMIT: usize = 256;
+const DISCORD_EMBED_DESCRIPTION_LIMIT: usize = 4096;
+const DISCORD_EMBED_FOOTER_LIMIT: usize = 2048;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DiscordWebhookFormat {
+    #[default]
+    Content,
+    Embed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotificationDirective {
+    notify: bool,
+    format: DiscordWebhookFormat,
+}
+
+impl Default for NotificationDirective {
+    fn default() -> Self {
+        Self {
+            notify: false,
+            format: DiscordWebhookFormat::Content,
+        }
+    }
+}
 
 pub async fn maybe_send_task_notification(
     notifications: Option<&NotificationsConfig>,
@@ -36,7 +63,8 @@ pub async fn maybe_send_task_notification(
         return Ok(());
     }
     let task_result = load_task_result(task, outcome, &task_notify.result_source)?;
-    if !should_send_notification(&task_result)? {
+    let directive = notification_directive(&task_result)?;
+    if !directive.notify {
         return Ok(());
     }
     let renderer = notifications.renderer.as_ref().ok_or_else(|| {
@@ -70,7 +98,15 @@ pub async fn maybe_send_task_notification(
     })?;
 
     let rendered = run_pi_renderer(renderer, task, &input_path, inherited_env).await?;
-    send_webhook(&webhook.url_env, &rendered, inherited_env).await?;
+    send_webhook(
+        webhook,
+        task,
+        outcome,
+        &rendered,
+        directive.format,
+        inherited_env,
+    )
+    .await?;
     let _ = fs::remove_dir_all(&temp_dir);
     Ok(())
 }
@@ -95,23 +131,39 @@ fn load_task_result(
     }
 }
 
-fn should_send_notification(task_result: &str) -> Result<bool> {
+fn notification_directive(task_result: &str) -> Result<NotificationDirective> {
     let trimmed = task_result.trim();
     if trimmed.is_empty() {
-        return Ok(true);
+        return Ok(NotificationDirective::default());
     }
 
     let parsed = match serde_json::from_str::<Value>(trimmed) {
         Ok(value) => value,
-        Err(_) => return Ok(true),
+        Err(_) => return Ok(NotificationDirective::default()),
     };
     let Some(object) = parsed.as_object() else {
-        return Ok(true);
+        return Ok(NotificationDirective::default());
     };
-    match object.get("notify") {
-        None => Ok(true),
-        Some(Value::Bool(value)) => Ok(*value),
+
+    let notify = match object.get("notify") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
         Some(_) => bail!("task notify result field 'notify' must be a boolean when present"),
+    };
+    let format = match object.get("format") {
+        None => DiscordWebhookFormat::Content,
+        Some(Value::String(value)) => parse_discord_webhook_format(value)?,
+        Some(_) => bail!("task notify result field 'format' must be a string when present"),
+    };
+
+    Ok(NotificationDirective { notify, format })
+}
+
+fn parse_discord_webhook_format(value: &str) -> Result<DiscordWebhookFormat> {
+    match value {
+        "content" => Ok(DiscordWebhookFormat::Content),
+        "embed" => Ok(DiscordWebhookFormat::Embed),
+        _ => bail!("task notify result field 'format' must be 'content' or 'embed' when present"),
     }
 }
 
@@ -204,17 +256,18 @@ async fn run_pi_renderer(
 }
 
 async fn send_webhook(
-    url_env: &str,
+    webhook: &WebhookConfig,
+    task: &TaskConfig,
+    outcome: &TaskOutcome,
     body: &str,
+    format: DiscordWebhookFormat,
     inherited_env: Option<&BTreeMap<String, String>>,
 ) -> Result<()> {
     let url = inherited_env
-        .and_then(|env| env.get(url_env).cloned())
-        .or_else(|| std::env::var(url_env).ok())
-        .with_context(|| format!("webhook env '{}' is not set", url_env))?;
-    let payload = DiscordWebhookPayload {
-        content: discord_content(body),
-    };
+        .and_then(|env| env.get(&webhook.url_env).cloned())
+        .or_else(|| std::env::var(&webhook.url_env).ok())
+        .with_context(|| format!("webhook env '{}' is not set", webhook.url_env))?;
+    let payload = discord_webhook_payload(task, outcome, body, format);
     let payload_body =
         serde_json::to_string(&payload).context("failed to encode discord webhook payload")?;
     let response = reqwest::Client::new()
@@ -235,6 +288,24 @@ async fn send_webhook(
     Ok(())
 }
 
+fn discord_webhook_payload(
+    task: &TaskConfig,
+    outcome: &TaskOutcome,
+    body: &str,
+    format: DiscordWebhookFormat,
+) -> DiscordWebhookPayload {
+    match format {
+        DiscordWebhookFormat::Content => DiscordWebhookPayload {
+            content: Some(discord_content(body)),
+            embeds: Vec::new(),
+        },
+        DiscordWebhookFormat::Embed => DiscordWebhookPayload {
+            content: None,
+            embeds: vec![discord_embed(task, outcome, body)],
+        },
+    }
+}
+
 fn discord_content(body: &str) -> String {
     if body.chars().count() <= DISCORD_CONTENT_LIMIT {
         return body.to_string();
@@ -245,9 +316,84 @@ fn discord_content(body: &str) -> String {
     format!("{prefix}{DISCORD_TRUNCATED_SUFFIX}")
 }
 
+fn discord_embed(task: &TaskConfig, outcome: &TaskOutcome, body: &str) -> DiscordEmbed {
+    let title = truncate_chars(
+        &format!("{} · {}", task.name, discord_status_label(outcome.status())),
+        DISCORD_EMBED_TITLE_LIMIT,
+        "…",
+    );
+    let description = truncate_chars(body, DISCORD_EMBED_DESCRIPTION_LIMIT, "\n\n[truncated]");
+    let footer = truncate_chars(
+        &format!(
+            "task_id={} · summary={} · exit_code={}",
+            task.id,
+            outcome.summary(),
+            outcome.exit_code()
+        ),
+        DISCORD_EMBED_FOOTER_LIMIT,
+        "…",
+    );
+
+    DiscordEmbed {
+        title,
+        description,
+        color: discord_embed_color(outcome.status()),
+        footer: DiscordEmbedFooter { text: footer },
+        timestamp: outcome.finished_at().to_rfc3339(),
+    }
+}
+
+fn truncate_chars(value: &str, limit: usize, suffix: &str) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+
+    let suffix_len = suffix.chars().count();
+    let prefix_len = limit.saturating_sub(suffix_len);
+    let prefix = value.chars().take(prefix_len).collect::<String>();
+    format!("{prefix}{suffix}")
+}
+
+fn discord_status_label(status: TaskRunStatus) -> &'static str {
+    match status {
+        TaskRunStatus::Success => "Success",
+        TaskRunStatus::Failed => "Failed",
+        TaskRunStatus::Error => "Error",
+        TaskRunStatus::TimedOut => "Timed Out",
+        TaskRunStatus::Cancelled => "Cancelled",
+    }
+}
+
+fn discord_embed_color(status: TaskRunStatus) -> u32 {
+    match status {
+        TaskRunStatus::Success => 0x57_F2_87,
+        TaskRunStatus::Failed => 0xED_42_45,
+        TaskRunStatus::Error => 0xC0_3F_4D,
+        TaskRunStatus::TimedOut => 0xFE_AE_2B,
+        TaskRunStatus::Cancelled => 0x58_65_F2,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct DiscordWebhookPayload {
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    embeds: Vec<DiscordEmbed>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscordEmbed {
+    title: String,
+    description: String,
+    color: u32,
+    footer: DiscordEmbedFooter,
+    timestamp: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscordEmbedFooter {
+    text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,8 +453,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        DISCORD_CONTENT_LIMIT, DISCORD_TRUNCATED_SUFFIX, discord_content,
-        maybe_send_task_notification,
+        DISCORD_CONTENT_LIMIT, DISCORD_TRUNCATED_SUFFIX, DiscordWebhookFormat, discord_content,
+        discord_webhook_payload, maybe_send_task_notification, notification_directive,
     };
     use crate::config::{
         CommandConfig, ConcurrencyConfig, NotificationsConfig, NotifyResultSourceConfig,
@@ -320,7 +466,8 @@ mod tests {
     async fn notification_runs_renderer_and_then_requires_webhook_env() {
         let dir = tempdir().expect("tempdir");
         let result_file = dir.path().join("result.txt");
-        std::fs::write(&result_file, "raw result").expect("write result");
+        std::fs::write(&result_file, r#"{"notify":true,"summary":"raw result"}"#)
+            .expect("write result");
         let renderer = dir.path().join("renderer.sh");
         std::fs::write(&renderer, "#!/bin/sh\nset -eu\nprintf 'rendered summary'\n")
             .expect("write renderer");
@@ -486,7 +633,7 @@ mod tests {
     async fn notification_uses_loaded_env_before_process_env() {
         let dir = tempdir().expect("tempdir");
         let result_file = dir.path().join("result.txt");
-        std::fs::write(&result_file, "raw result").expect("write result");
+        std::fs::write(&result_file, r#"{"notify":true,"format":"embed"}"#).expect("write result");
         let renderer = dir.path().join("renderer.sh");
         std::fs::write(&renderer, "#!/bin/sh\nset -eu\nprintf 'rendered summary'\n")
             .expect("write renderer");
@@ -584,6 +731,82 @@ mod tests {
     }
 
     #[test]
+    fn discord_webhook_payload_uses_content_by_default() {
+        let task = sample_task();
+        let outcome = sample_outcome(TaskRunStatus::Success);
+        let payload = serde_json::to_value(discord_webhook_payload(
+            &task,
+            &outcome,
+            "rendered summary",
+            DiscordWebhookFormat::Content,
+        ))
+        .expect("serialize payload");
+
+        assert_eq!(payload["content"], "rendered summary");
+        assert!(payload.get("embeds").is_none());
+    }
+
+    #[test]
+    fn discord_webhook_payload_supports_embed_format() {
+        let task = sample_task();
+        let outcome = sample_outcome(TaskRunStatus::TimedOut);
+        let payload = serde_json::to_value(discord_webhook_payload(
+            &task,
+            &outcome,
+            "rendered **markdown** body",
+            DiscordWebhookFormat::Embed,
+        ))
+        .expect("serialize payload");
+
+        assert!(payload.get("content").is_none());
+        assert_eq!(
+            payload["embeds"][0]["description"],
+            "rendered **markdown** body"
+        );
+        assert_eq!(payload["embeds"][0]["color"], 16690731u64);
+        assert_eq!(payload["embeds"][0]["title"], "job · Timed Out");
+        assert!(
+            payload["embeds"][0]["footer"]["text"]
+                .as_str()
+                .expect("footer text")
+                .contains("task_id=job")
+        );
+    }
+
+    #[test]
+    fn notification_directive_defaults_to_not_sending() {
+        let directive = notification_directive("plain text result").expect("directive");
+
+        assert!(!directive.notify);
+        assert_eq!(directive.format, DiscordWebhookFormat::Content);
+    }
+
+    #[test]
+    fn notification_directive_supports_embed_override() {
+        let directive =
+            notification_directive(r#"{"notify":true,"format":"embed"}"#).expect("directive");
+
+        assert!(directive.notify);
+        assert_eq!(directive.format, DiscordWebhookFormat::Embed);
+    }
+
+    #[test]
+    fn notification_directive_defaults_to_not_sending_for_json_without_notify() {
+        let directive = notification_directive(r#"{"format":"embed"}"#).expect("directive");
+
+        assert!(!directive.notify);
+        assert_eq!(directive.format, DiscordWebhookFormat::Embed);
+    }
+
+    #[test]
+    fn notification_directive_rejects_invalid_format() {
+        let error =
+            notification_directive(r#"{"notify":true,"format":"card"}"#).expect_err("directive");
+
+        assert!(error.to_string().contains("'content' or 'embed'"));
+    }
+
+    #[test]
     fn discord_content_keeps_short_body() {
         let body = "short body";
         assert_eq!(discord_content(body), body);
@@ -596,5 +819,34 @@ mod tests {
 
         assert_eq!(content.chars().count(), DISCORD_CONTENT_LIMIT);
         assert!(content.ends_with(DISCORD_TRUNCATED_SUFFIX));
+    }
+
+    fn sample_task() -> TaskConfig {
+        TaskConfig {
+            id: "job".to_string(),
+            name: "job".to_string(),
+            enabled: true,
+            concurrency: ConcurrencyConfig::default(),
+            retry: RetryConfig::default(),
+            schedule: ScheduleConfig::Interval { seconds: 60 },
+            notify: None,
+            command: CommandConfig {
+                program: "/bin/echo".to_string(),
+                args: vec!["ok".to_string()],
+                workdir: None,
+                timeout_seconds: None,
+                env: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn sample_outcome(status: TaskRunStatus) -> TaskOutcome {
+        TaskOutcome::synthetic(
+            status,
+            "exit code 0".to_string(),
+            0,
+            chrono::Utc::now(),
+            chrono::Utc::now(),
+        )
     }
 }

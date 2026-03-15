@@ -221,12 +221,12 @@ tasks:
 
 `env_files` 里的文件按顺序加载，后面的同名变量会覆盖前面的值；任务级 `command.env` 和通知级 `renderer.env` 仍然有更高优先级。
 
-可选地，你也可以让任务结果自己决定本次是否通知，例如：
+你也可以让任务结果自己决定本次是否通知。当前语义是：只有结果 JSON 显式给出 `notify: true` 才会发送通知；不传时默认不发。
 
 ```json
 {
-  "notify": false,
-  "summary": "routine success"
+  "notify": true,
+  "summary": "attention needed"
 }
 ```
 
@@ -250,7 +250,34 @@ tasks:
 - 超过 2000 字符会自动截断
 - 截断后会追加 `[truncated]`
 
-这版不做 Discord embed，先保持简单。
+也支持可选的 Discord embed 模式：
+
+- 默认 `format` 是 `content`
+- 在任务结果 JSON 顶层写 `format: "embed"` 时，发送 `embeds`
+- embed 标题会包含任务名和状态
+- embed 描述使用 renderer 输出的 markdown
+- embed 会附带颜色、footer 和完成时间
+- embed 描述超过 4096 字符时会自动截断
+
+通知结果 JSON schema 目前支持这两个可选字段：
+
+- `notify: boolean`
+- `format: "content" | "embed"`
+
+其中：
+
+- `notify` 缺省时默认 `false`
+- `format` 缺省时默认 `content`
+
+例如：
+
+```json
+{
+  "notify": true,
+  "format": "embed",
+  "summary": "attention needed"
+}
+```
 
 ## Enable Notifications
 
